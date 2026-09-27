@@ -7,8 +7,12 @@
 # Two copies of a build recipe drift; this file is the single source of truth.
 #
 # It does the provenance-critical work in the right order:
-#   1. sync the pinned manifest, with the manifests checkout pinned to the exact
-#      revision recorded in image/manifest/arcadia-x86.pin.json;
+#   1. install the committed frozen lock (image/manifest/arcadia-x86.pinned.xml) as
+#      repo's ACTIVE manifest and sync against it, so every project is fetched at an
+#      immutable SHA/tag - never a moving upstream ref (arcadia-x86, master) that can
+#      404 and leave the tree silently incomplete. The upstream manifests checkout is
+#      still pinned to the exact revision recorded in image/manifest/arcadia-x86.pin.json
+#      for provenance, but its moving per-project refs are no longer what repo syncs;
 #   2. re-confirm the committed X1 lock against the synced tree using
 #      `repo manifest -r` - the canonical build-side witness that the network-only
 #      resolver (tools/manifest/resolve-manifest-lock.py) is checked against;
@@ -129,6 +133,41 @@ if [ -z "${SKIP_SYNC:-}" ]; then
   [ "$pinned_manifests" = "$MANIFEST_REVISION" ] \
     || die "manifests checkout is $pinned_manifests, expected $MANIFEST_REVISION"
 
+  # THE ARCHITECTURAL FIX (root cause of jobs 302004 / 302127).
+  #
+  # The upstream arcadia-x86 manifest at $MANIFEST_REVISION pins many projects to MOVING
+  # refs - bootable/aaropa at revision="arcadia-x86", and a dozen others at
+  # revision="master" on repos whose default branch was since renamed to "main". Those
+  # refs now 404. `repo sync`/resync.sh then log
+  #   revision refs/heads/master in manifests not found
+  #   error: Cannot fetch ... couldn't find remote ref refs/heads/master
+  # abort those projects mid-sync, yet STILL print "All repositories synchronized
+  # successfully". The tree is left incomplete (~796 of 1183 projects), and the very
+  # next `repo manifest -r` dies with a raw FileNotFoundError on the first unmaterialized
+  # path (observed: bootable/aaropa). Retrying is futile: the refs are gone upstream.
+  #
+  # We already hold every one of those projects as a FROZEN, reachable SHA/tag in the
+  # committed X1 lock (image/manifest/arcadia-x86.pinned.xml - 1183 projects, all
+  # immutable, verify-lock.py PASSES, aaropa=01fbf03... verified live). So we hand repo
+  # the lock as its ACTIVE manifest instead of the moving upstream one: repo then fetches
+  # each project by an immutable ref that cannot 404, which makes the refs/heads/master /
+  # aaropa failure structurally impossible.
+  #
+  # This is repo's own supported mechanism: a manifest file placed inside the manifests
+  # checkout and selected with `repo init -m <file>`. It does NOT touch the pre-seeded
+  # source, does NOT `rm -rf` anything, and keeps --depth=1 + resync.sh below - so it
+  # honours crave/rules.md (no needless full re-sync, sync at the workspace root). The
+  # lock is self-contained (19 <remote>, 1 <default>, 0 <include>), so it stands alone as
+  # repo's manifest. The upstream checkout stays pinned at $MANIFEST_REVISION above purely
+  # for provenance; its moving per-project refs are no longer what gets synced.
+  LOCK_XML="$REPO_ROOT/image/manifest/arcadia-x86.pinned.xml"
+  [ -f "$LOCK_XML" ] || die "frozen lock not found: $LOCK_XML"
+  log "installing the frozen X1 lock as repo's active manifest (immutable SHAs, no moving refs)"
+  cp -f "$LOCK_XML" .repo/manifests/emberbird-pinned.xml
+  repo init -m emberbird-pinned.xml
+  active_manifest="$(repo manifest 2>/dev/null | grep -c '<project' || true)"
+  printf 'active manifest projects: %s (expected 1183 from the frozen lock)\n' "$active_manifest"
+
   # Crave ships a conflict-tolerant sync and its docs strongly prefer it over raw
   # `repo sync` (crave/getting-started/building-crave-run.md): "We strongly suggest
   # using /opt/crave/resync.sh ... since resync automatically handles conflicts".
@@ -145,14 +184,14 @@ if [ -z "${SKIP_SYNC:-}" ]; then
     repo sync -c -j"$SYNC_JOBS" --no-tags --force-sync
   fi
 
-  # A pre-seeded Crave tree was synced for the BASE project's manifest (LOS 20). When we
-  # re-point .repo to our BlissRoms arcadia-x86 manifest, resync.sh prunes/optimizes and
-  # can report "All repositories synchronized successfully" while a NEWLY-ADDED project
-  # path was never materialized on disk. `repo manifest -r` then dies with a raw
-  # FileNotFoundError on the first missing project (observed: bootable/aaropa, job
-  # 302004). Verify every manifest project path exists; sync ONLY the missing ones
-  # (crave/rules.md forbids a needless full re-sync of the pre-seeded tree), then re-check
-  # and stop with a precise list if anything is still absent.
+  # Defense in depth. The active manifest is now the frozen lock (every ref immutable),
+  # so the moving-ref abort that silently left ~387 projects unmaterialized cannot recur.
+  # But a pre-seeded Crave tree was synced for the BASE project (LOS 20); when we re-point
+  # .repo at our lock, resync.sh prunes/optimizes and can still report success while a
+  # NEWLY-ADDED project path was not materialized. `repo manifest -r` then dies with a raw
+  # FileNotFoundError on the first missing project. Verify every manifest project path
+  # exists; sync ONLY the missing ones (crave/rules.md forbids a needless full re-sync of
+  # the pre-seeded tree), then re-check and stop with a precise list if anything is absent.
   log "verifying the synced tree is complete (every manifest project present on disk)"
   total=0
   missing_projects=""
@@ -169,19 +208,19 @@ if [ -z "${SKIP_SYNC:-}" ]; then
     # Targeted sync of just the missing project paths - never a full re-sync (Crave rule).
     # shellcheck disable=SC2086
     if ! repo sync -c -j"$SYNC_JOBS" --no-tags --force-sync $missing_projects; then
-      die "targeted sync of the missing projects failed:$missing_projects. If a project pins a ref upstream removed (the log's 'revision refs/heads/master ... not found'), the pinned manifest $MANIFEST_REVISION must be re-cut (tools/manifest/resolve-manifest-lock.py)."
+      die "targeted sync of the missing projects failed:$missing_projects. The active manifest is the frozen lock (all immutable SHAs/tags), so this is a fetch/network fault, not a moving-ref 404 - retry, or re-cut the lock only if a pinned SHA has become unreachable upstream (tools/manifest/resolve-manifest-lock.py)."
     fi
     still=""
     for p in $missing_projects; do
       [ -d "$WORKSPACE/$p" ] || still="$still $p"
     done
-    [ -z "$still" ] || die "still missing after a targeted sync:$still. The pinned manifest $MANIFEST_REVISION references project(s) the tree cannot materialize; re-cut the lock."
+    [ -z "$still" ] || die "still missing after a targeted sync:$still. The frozen lock references project(s) the tree cannot materialize (an immutable ref went unreachable upstream); re-cut the lock."
   fi
   log "sync complete: all $total manifest projects present on disk"
 
   log "canonical check: repo manifest -r against the committed X1 lock"
   repo manifest -r -o "$OUT_DIR/repo-manifest-r.xml" \
-    || die "repo manifest -r failed - the synced tree is missing or cannot resolve a project the pinned manifest $MANIFEST_REVISION references (see the sync-completeness step above), so the canonical X1 witness cannot be produced."
+    || die "repo manifest -r failed - the synced tree is missing or cannot resolve a project the frozen lock references (see the sync-completeness step above), so the canonical X1 witness cannot be produced."
   cd "$REPO_ROOT"
   python3 tools/manifest/verify-lock.py || die "the synced tree does not match the committed X1 lock - stopping before the build"
 else
