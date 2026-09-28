@@ -128,6 +128,25 @@ if [ -z "${SKIP_SYNC:-}" ]; then
   repo init -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH" --git-lfs --depth=1
   git -C .repo/manifests fetch --depth=1 origin "$MANIFEST_REVISION"
   git -C .repo/manifests checkout --detach "$MANIFEST_REVISION"
+
+  # Pin the manifests project's own git tracking refspec to arcadia-x86.
+  #
+  # WHY: on a Crave pre-seeded LOS 20 tree, .repo/manifests was cloned for a project
+  # whose default branch is `master`, so `branch.default.merge` is `refs/heads/master`
+  # and `remote.origin.fetch` maps `refs/heads/*`. When resync.sh / `repo sync` sync the
+  # `manifests` project itself, they consult that tracking ref and try to fetch
+  # `refs/heads/master` from BlissRoms-x86/manifest.git - which has no `master` branch,
+  # only `arcadia-x86`. That is the source of the log line
+  #   error: ... revision refs/heads/master in manifests not found
+  #   fatal: couldn't find remote ref refs/heads/master
+  # Repointing the tracking branch AND the fetch refspec at arcadia-x86 makes that
+  # lookup resolve to a ref that exists, so the manifests-project sync stops aborting.
+  # (The manifests worktree stays detached at $MANIFEST_REVISION for provenance; this
+  # only fixes which remote ref a background sync of the manifests repo consults.)
+  git -C .repo/manifests config branch.default.merge refs/heads/arcadia-x86
+  git -C .repo/manifests config remote.origin.fetch \
+    "+refs/heads/arcadia-x86:refs/remotes/origin/arcadia-x86"
+
   pinned_manifests="$(git -C .repo/manifests rev-parse HEAD)"
   printf 'manifests checkout: %s\n' "$pinned_manifests"
   [ "$pinned_manifests" = "$MANIFEST_REVISION" ] \
@@ -208,46 +227,104 @@ MANIFEST_XML
     log "repo sync via /opt/crave/resync.sh (Crave conflict-tolerant sync; multi-hundred-GB step)"
     /opt/crave/resync.sh || {
       log "resync.sh returned non-zero - falling back to a plain repo sync"
-      repo sync -c -j"$SYNC_JOBS" --no-tags --force-sync
+      repo sync -c -j"$SYNC_JOBS" --no-manifest-update --no-tags --force-sync
     }
   else
     log "repo sync (this is the multi-hour, multi-hundred-GB step)"
-    repo sync -c -j"$SYNC_JOBS" --no-tags --force-sync
+    repo sync -c -j"$SYNC_JOBS" --no-manifest-update --no-tags --force-sync
   fi
 
-  # Defense in depth. The active manifest is now the frozen lock (every ref immutable),
-  # so the moving-ref abort that silently left ~387 projects unmaterialized cannot recur.
-  # But a pre-seeded Crave tree was synced for the BASE project (LOS 20); when we re-point
-  # .repo at our lock, resync.sh prunes/optimizes and can still report success while a
-  # NEWLY-ADDED project path was not materialized. `repo manifest -r` then dies with a raw
-  # FileNotFoundError on the first missing project. Verify every manifest project path
-  # exists; sync ONLY the missing ones (crave/rules.md forbids a needless full re-sync of
-  # the pre-seeded tree), then re-check and stop with a precise list if anything is absent.
-  log "verifying the synced tree is complete (every manifest project present on disk)"
-  total=0
-  missing_projects=""
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    total=$(( total + 1 ))
-    [ -d "$WORKSPACE/$p" ] || missing_projects="$missing_projects $p"
-  done < <(repo list -p 2>/dev/null)
-  if [ -n "$missing_projects" ]; then
-    # shellcheck disable=SC2086
-    set -- $missing_projects
-    log "sync incomplete: $# of $total project(s) absent on disk - syncing only those"
-    printf '  missing:%s\n' "$missing_projects"
+  # Defense in depth, made XML-authoritative.
+  #
+  # The active manifest is now the frozen lock (every ref immutable), so the moving-ref
+  # abort that silently left projects unmaterialized cannot recur. But a pre-seeded Crave
+  # tree was synced for the BASE project (LOS 20); when we re-point .repo at our lock,
+  # resync.sh prunes/optimizes and can still report "synchronized successfully" while the
+  # ~379 Bliss delta projects that LOS 20 never had (bootable/aaropa among them) are
+  # absent on disk. `repo manifest -r` then dies with a raw FileNotFoundError on the first
+  # missing path.
+  #
+  # The OLD guard walked `repo list -p`, which is itself derived from what repo has on
+  # disk / in its project list - so a project that never materialized could be absent
+  # from that list too, and the guard would under-count and pass. We instead parse the
+  # COMMITTED lock XML directly: it is the authoritative set of paths that MUST exist,
+  # independent of repo's on-disk state. We drop only the `notdefault` group (repo's own
+  # default-linux exclusion), which yields exactly the 1175 active projects that a
+  # default sync on this Linux host is expected to materialize.
+  log "verifying the synced tree is complete (XML-authoritative, not repo's on-disk view)"
+  LOCK_XML="$REPO_ROOT/image/manifest/arcadia-x86.pinned.xml"
+  # Capture via command substitution (NOT `mapfile < <(...)`): process substitution
+  # discards the child's exit status, so a failing extractor would be masked. Command
+  # substitution propagates it, and `set -e` then halts before any partial sync.
+  required_list="$(
+    LOCK_XML="$LOCK_XML" python3 - <<'PY'
+import os, sys, xml.etree.ElementTree as ET
+
+# Force LF-only output so a path never carries a trailing CR into bash (matters if
+# this ever runs under a Windows python; on the Crave Linux host it is already LF).
+try:
+    sys.stdout.reconfigure(newline="\n")
+except (AttributeError, ValueError):
+    pass
+
+root = ET.parse(os.environ["LOCK_XML"]).getroot()
+required = []
+for p in root.findall("project"):
+    groups = {g.strip() for g in (p.get("groups", "")).split(",") if g.strip()}
+    # repo's default-linux filter drops `notdefault`; it does NOT drop the bare
+    # darwin-tagged prebuilts (they are not `platform-darwin`), so they stay in.
+    if "notdefault" in groups:
+        continue
+    path = p.get("path") or p.get("name")
+    if not path:
+        print("ERROR: project without path/name in lock", file=sys.stderr)
+        sys.exit(2)
+    required.append(path)
+
+EXPECTED = 1175  # 1183 total - 8 notdefault projects
+if len(required) != EXPECTED:
+    print(
+        f"ERROR: lock yields {len(required)} active projects, expected {EXPECTED} "
+        f"(1183 total - 8 notdefault). The committed lock changed; update EXPECTED "
+        f"and re-verify.",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+if len(set(required)) != len(required):
+    print("ERROR: duplicate project paths in lock", file=sys.stderr)
+    sys.exit(4)
+print("\n".join(required))
+PY
+  )" || die "could not extract the authoritative project set from $LOCK_XML (see error above); refusing to sync against an unverified manifest."
+  mapfile -t required_paths <<<"$required_list"
+
+  total="${#required_paths[@]}"
+  printf 'authoritative manifest project set: %s (expected 1175 active Linux projects)\n' "$total"
+
+  # Deterministic missing-project detection. Use a real array (not a space-joined
+  # string) so `repo sync` receives each path as a distinct argument and no SC2086
+  # word-splitting hack is needed.
+  missing_projects=()
+  for p in "${required_paths[@]}"; do
+    [ -d "$WORKSPACE/$p" ] || missing_projects+=("$p")
+  done
+
+  if [ "${#missing_projects[@]}" -gt 0 ]; then
+    log "missing delta projects: ${#missing_projects[@]} of $total (Bliss deltas absent from the pre-seeded LOS 20 baseline, e.g. bootable/aaropa) - syncing only those"
+    printf '  missing (%s): %s\n' "${#missing_projects[@]}" "${missing_projects[*]}"
     # Targeted sync of just the missing project paths - never a full re-sync (Crave rule).
-    # shellcheck disable=SC2086
-    if ! repo sync -c -j"$SYNC_JOBS" --no-tags --force-sync $missing_projects; then
-      die "targeted sync of the missing projects failed:$missing_projects. The active manifest is the frozen lock (all immutable SHAs/tags), so this is a fetch/network fault, not a moving-ref 404 - retry, or re-cut the lock only if a pinned SHA has become unreachable upstream (tools/manifest/resolve-manifest-lock.py)."
+    # --no-manifest-update so this never re-consults the manifests remote ref either.
+    if ! repo sync -c -j"$SYNC_JOBS" --no-manifest-update --no-tags --force-sync "${missing_projects[@]}"; then
+      die "targeted sync of the missing projects failed: ${missing_projects[*]}. The active manifest is the frozen lock (all immutable SHAs/tags), so this is a fetch/network fault, not a moving-ref 404 - retry, or re-cut the lock only if a pinned SHA has become unreachable upstream (tools/manifest/resolve-manifest-lock.py)."
     fi
-    still=""
-    for p in $missing_projects; do
-      [ -d "$WORKSPACE/$p" ] || still="$still $p"
+    # Post-sync verification: 100% of the authoritative set must now exist on disk.
+    still=()
+    for p in "${missing_projects[@]}"; do
+      [ -d "$WORKSPACE/$p" ] || still+=("$p")
     done
-    [ -z "$still" ] || die "still missing after a targeted sync:$still. The frozen lock references project(s) the tree cannot materialize (an immutable ref went unreachable upstream); re-cut the lock."
+    [ "${#still[@]}" -eq 0 ] || die "still missing after a targeted sync: ${still[*]}. The frozen lock references project(s) the tree cannot materialize (an immutable ref went unreachable upstream); re-cut the lock."
   fi
-  log "sync complete: all $total manifest projects present on disk"
+  log "sync complete: all $total active manifest projects present on disk"
 
   log "canonical check: repo manifest -r against the committed X1 lock"
   repo manifest -r -o "$OUT_DIR/repo-manifest-r.xml" \
