@@ -57,6 +57,19 @@ _SPEC.loader.exec_module(resolver)
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# The build recipe (tools/guest-build/build-from-manifest.sh) syncs the active
+# project set on a Linux host and hardcodes this count as its completeness target.
+# repo's default-linux filter drops exactly the `notdefault` group, so the active
+# set is (total projects - notdefault projects). If the committed lock is re-cut
+# and this count changes, the recipe's 1175-guard would fail mid-build on Crave;
+# we catch that drift here, at author time, instead. Keep this in lockstep with
+# the EXPECTED constant in build-from-manifest.sh.
+EXPECTED_ACTIVE_PROJECTS = 1175
+
+
+def groups_of(project: dict[str, str]) -> set[str]:
+    return {g.strip() for g in (project.get("groups") or "").split(",") if g.strip()}
+
 PROBLEMS: list[str] = []
 NOTES: list[str] = []
 
@@ -137,6 +150,28 @@ def main(argv: list[str] | None = None) -> int:
         problem("duplicate project paths in the lock: %s" % ", ".join(dupes[:8]))
     else:
         ok("project paths are unique")
+
+    # Active-project count invariant (drift guard for the build recipe).
+    # A default sync on a Linux host materializes every project EXCEPT those in the
+    # `notdefault` group. build-from-manifest.sh asserts exactly this count on disk
+    # before it will build, so pin it here to fail at author time if the lock is
+    # re-cut in a way that changes it.
+    active = [p for p in projects if "notdefault" not in groups_of(p)]
+    notdefault_count = len(projects) - len(active)
+    if len(active) != EXPECTED_ACTIVE_PROJECTS:
+        problem(
+            "active (non-notdefault) project count is %d, expected %d "
+            "(%d total - %d notdefault). The lock was re-cut; update "
+            "EXPECTED_ACTIVE_PROJECTS here AND the EXPECTED constant in "
+            "tools/guest-build/build-from-manifest.sh together."
+            % (len(active), EXPECTED_ACTIVE_PROJECTS, len(projects), notdefault_count)
+        )
+    else:
+        ok(
+            "active project count is %d (%d total - %d notdefault), matching the "
+            "build recipe's completeness target"
+            % (len(active), len(projects), notdefault_count)
+        )
 
     lock_pin = None
     with open(args.lock, encoding="utf-8") as fh:
