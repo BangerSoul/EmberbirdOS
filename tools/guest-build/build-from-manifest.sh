@@ -361,20 +361,48 @@ PYTHONPATH="$REPO_ROOT" python3 - "$WORKSPACE" "$OUT_DIR" <<'PY'
 import datetime, hashlib, json, os, pathlib, platform, shutil, sys
 
 ws, out_dir = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-imgs = sorted(p for p in list(ws.glob('out/**/*.iso')) + list(ws.glob('out/**/*.img')) if p.is_file())
+
+
+def find_artifacts(root):
+    """Find the built .iso/.img artifacts without walking the whole AOSP out/ tree.
+
+    `iso_img` writes under out/target/product/<device>/, while out/ itself holds
+    hundreds of GB and millions of inodes - so a recursive `out/**` scan is minutes
+    of I/O to locate a handful of files. Scan the product dirs first in a SINGLE pass
+    over both extensions, and fall back to a full out/ scan only when that finds
+    nothing, so a tree that writes its artifact somewhere else is still recorded.
+    """
+    def scan(base):
+        hits = []
+        for dirpath, _dirs, filenames in os.walk(base):
+            for name in filenames:
+                if name.endswith('.iso') or name.endswith('.img'):
+                    hits.append(pathlib.Path(dirpath) / name)
+        return hits
+
+    product = root / 'out' / 'target' / 'product'
+    hits = scan(product) if product.is_dir() else []
+    if not hits:
+        hits = scan(root / 'out')
+    return sorted(hits)
+
+
+imgs = find_artifacts(ws)
 records = []
 for p in imgs:
     h = hashlib.sha256()
     with p.open('rb') as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b''):
             h.update(chunk)
-    records.append({'artifact': p.name, 'sha256': h.hexdigest(), 'bytes': p.stat().st_size})
-    print('  %s  %s  %d bytes' % (h.hexdigest(), p.name, p.stat().st_size))
+    size = p.stat().st_size
+    digest = h.hexdigest()
+    records.append({'artifact': p.name, 'sha256': digest, 'bytes': size})
+    print('  %s  %s  %d bytes' % (digest, p.name, size))
     # The image lives deep in the AOSP out/ tree. Copy it next to the provenance
     # record so a single `crave pull image/out/` retrieves the artifact and its hash
     # together - the build host is ephemeral from the operator's point of view.
     dest = out_dir / p.name
-    if not dest.exists() or dest.stat().st_size != p.stat().st_size:
+    if not dest.exists() or dest.stat().st_size != size:
         print('  copying -> %s' % dest)
         shutil.copy2(p, dest)
 

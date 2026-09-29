@@ -53,6 +53,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -162,20 +163,22 @@ def ls_remote(
 
     Returns ``(sha, resolved_ref, error)``; ``sha`` is None on failure and
     ``error`` then carries the last diagnostic. Tries the most specific ref
-    first (an explicit ``refs/...``, else heads/tags/bare) and retries the
-    whole candidate set with linear backoff on transient network failure."""
+    first (an explicit ``refs/...``, else heads/tags/bare) and retries with
+    linear backoff -- but only the candidates that failed for a TRANSIENT
+    reason. A candidate whose ``git ls-remote`` exited 0 and simply matched no
+    ref is a definitive answer for that ref, so retrying it would only repeat a
+    network round trip -- and hold this pool worker in backoff while it does."""
     if revision.startswith("refs/"):
-        candidates = [revision]
+        pending = [revision]
     else:
-        candidates = ["refs/heads/" + revision, "refs/tags/" + revision, revision]
+        pending = ["refs/heads/" + revision, "refs/tags/" + revision, revision]
 
     error = "no matching ref"
     for attempt in range(max(1, retries)):
         if attempt:
-            import time
-
             time.sleep(min(2.0 * attempt, 5.0))  # linear backoff, capped
-        for ref in candidates:
+        retry_next: list[str] = []
+        for ref in pending:
             try:
                 proc = subprocess.run(
                     ["git", "ls-remote", url, ref],
@@ -185,17 +188,24 @@ def ls_remote(
                 )
             except subprocess.TimeoutExpired:
                 error = "timeout after %ss" % timeout
+                retry_next.append(ref)
                 continue
             except OSError as exc:
                 error = "git exec failed: %s" % exc
+                retry_next.append(ref)
                 continue
             if proc.returncode != 0:
                 error = "git ls-remote exit %d" % proc.returncode
+                retry_next.append(ref)
                 continue
             sha, matched = _pick_ref_line(proc.stdout, ref)
             if sha and SHA_RE.fullmatch(sha):
                 return (sha, matched, "")
+            # exit 0 with no match is permanent for this ref: never retried.
             error = "no matching ref"
+        pending = retry_next
+        if not pending:
+            break
     return (None, None, error)
 
 
