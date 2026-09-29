@@ -38,11 +38,23 @@ The lock resolves the branch/tag gap above: **every one of the 1183 projects car
 | Resumable cache | [`.lock-checkpoint.json`](.lock-checkpoint.json) — the committed record of how each ref resolved; reused (and rewritten) by later runs so a re-lock repeats no network work |
 | Generator | [`../../tools/manifest/resolve-manifest-lock.py`](../../tools/manifest/resolve-manifest-lock.py) |
 | Verifier | [`../../tools/manifest/verify-lock.py`](../../tools/manifest/verify-lock.py) |
+| Verifier regression test | [`../../tools/manifest/test-verify-lock.py`](../../tools/manifest/test-verify-lock.py) — offline, no network, run by the blocking `manifest-lock` job |
 | Evidence | [`../../docs/evidence/M2/x1-lock-reproducibility.txt`](../../docs/evidence/M2/x1-lock-reproducibility.txt) |
 
 **How it was produced — and why it isn't a `repo sync`.** The lock was resolved **over the network only** (`git ls-remote` per moving ref, cached and resumable): the 886 tag/SHA-pinned projects were already immutable, and the 297 branch-tracking forks were resolved to SHAs. This produces the same lock without the multi-GB source sync, which is exactly what the M2 host could not accommodate (~104 GB free vs ~300+ GB needed).
 
-**It is verified, not merely claimed.** Re-running the generator against the pinned upstream reproduces the committed lock **byte-for-byte**, and `tools/manifest/verify-lock.py --live` re-derives every moving ref from scratch and requires both (a) every SHA to match the committed lock and (b) the regenerated file to be byte-identical. CI enforces this on every push ([`../../.github/workflows/verify-provenance.yml`](../../.github/workflows/verify-provenance.yml)).
+**It is verified, not merely claimed.** Re-running the generator against the pinned upstream reproduces the committed lock **byte-for-byte**, and `tools/manifest/verify-lock.py --live` re-derives every moving ref from scratch and requires both (a) every SHA to match the committed lock and (b) the regenerated file to be byte-identical.
+
+CI splits the two by what the signal means ([`../../.github/workflows/verify-provenance.yml`](../../.github/workflows/verify-provenance.yml)):
+
+| Check | Runs | Enforced | What a red result means |
+|---|---|---|---|
+| `manifest-lock` — captured-manifest hashes + offline structural verification + the verifier's own exit-code regression test | every push / PR | **blocking** | someone edited the captured manifests or the lock. A real integrity failure. |
+| `lock-reproducibility` — `--live` re-resolution | nightly + manual dispatch | **advisory** | upstream branches moved since the lock was cut. Expected over time. |
+
+**The advisory job reads an exit code, not a log line.** `verify-lock.py` exits `0` (all checks passed), `1` (the lock does not match — a structural failure, live drift, or a lock that does not re-derive byte-for-byte) or `2` (the live re-resolution could not finish: one or more refs came back unresolved). Anything else is reported as unclassified rather than guessed at. **`2` deliberately outranks `1`**: a partially-resolved run cannot support a drift claim, so a network flake can never be published as "your lock is stale" — and an unresolved ref is excluded from the drift list rather than falling back to its moving branch name and manufacturing a phantom entry. The full finding set is written to a findings report (`--findings-file PATH`) that CI renders whole, so nothing is cut off mid-diff. The contract is pinned by [`../../tools/manifest/test-verify-lock.py`](../../tools/manifest/test-verify-lock.py), which runs offline in the blocking job.
+
+The live check is deliberately not a required check: the ~297 refs it re-resolves are `upstream="main"` branches that Bliss/LineageOS advance continuously, so it would otherwise go red on its own and block every contributor until the lock was re-cut. **Drift is not a build risk** — `build-from-manifest.sh` installs the frozen lock as repo's active manifest and syncs the immutable SHAs, so an upstream move changes nothing about what gets built. Re-cutting remains an owner's decision because it moves the M2 X2 provenance anchor.
 
 **The canonical build-time confirmation remains `repo sync && repo manifest -r`**, which is run inside [`../../.github/workflows/guest-build.yml`](../../.github/workflows/guest-build.yml) and checked against this lock before the guest is built. The network-only resolver is the provenance anchor; the sync-side lock is the build-side witness.
 

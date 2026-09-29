@@ -20,14 +20,42 @@ structural (default, offline, no network)
 ``--live`` additionally re-resolves every moving ref over the network with
 ``resolve-manifest-lock.py``'s own machinery -- on a fresh, empty cache -- and
 compares (a) each project's SHA and (b) the regenerated lock byte-for-byte
-against the committed one. Any difference is reported as drift and fails the run,
-because it means either the lock was corrupted or the upstream branches moved and
-the lock must be re-cut.
+against the committed one. Any difference is reported as drift.
+
+EXIT CODES
+    The exit code is the machine-readable result, and it is the ONLY thing CI
+    branches on -- nothing downstream has to parse this tool's prose.
+
+    0  every check passed.
+    1  the lock does not match what it should: a structural failure (the offline
+       invariants), or live drift, or a regenerated lock that differs from the
+       committed bytes. This is a statement about the LOCK, and it is actionable.
+    2  the live re-resolution could not finish: one or more projects came back
+       unresolved (network down, a remote 404/rate-limited, a timeout). Nothing
+       has been proven either way. This is a statement about the RUN, and the
+       correct response is to re-run -- never to re-cut the lock.
+
+    2 deliberately outranks 1. A partially-resolved run cannot support a drift
+    claim, so reporting "your lock is stale" on the strength of a flaky network
+    would put a false statement into a provenance record. Unresolved records are
+    also excluded from the drift list itself, so a ref that failed to fetch is
+    never counted as evidence that upstream moved.
+
+Note that the two modes are NOT equally trustworthy, and CI treats them
+differently for that reason. The offline mode is deterministic and depends only
+on committed bytes, so ``verify-provenance.yml`` runs it on every push as a
+blocking required check. The ``--live`` mode re-resolves ~297 ``upstream="main"``
+refs that Bliss/LineageOS advance continuously, so it drifts on its own over
+time; CI therefore runs it on a nightly schedule as an **advisory** check that
+reports drift and never fails the run. Drift is not a build risk -- the build
+recipe syncs the frozen lock's immutable SHAs, so a moved upstream branch changes
+nothing about what gets built.
 
 Usage::
 
     python tools/manifest/verify-lock.py                 # offline structural check
-    python tools/manifest/verify-lock.py --live           # + live re-resolution (CI)
+    python tools/manifest/verify-lock.py --live           # + live re-resolution (advisory)
+    python tools/manifest/verify-lock.py --live --findings-file out.txt
 """
 
 from __future__ import annotations
@@ -66,16 +94,40 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # the EXPECTED constant in build-from-manifest.sh.
 EXPECTED_ACTIVE_PROJECTS = 1175
 
+# How much of a large finding is shown inline. The bounds live HERE, where the
+# finding is built, rather than in whatever consumes it -- so a consumer can
+# render the findings file verbatim and still be sure it is complete. Each
+# message states how many entries it left out when a bound bites.
+DRIFT_SHOWN = 12
+UNRESOLVED_SHOWN = 8
+DIFF_LINES_SHOWN = 20
+
 
 def groups_of(project: dict[str, str]) -> set[str]:
     return {g.strip() for g in (project.get("groups") or "").split(",") if g.strip()}
 
 PROBLEMS: list[str] = []
+# Category tag per problem, index-aligned with PROBLEMS. Categories are what the
+# exit code is derived from, and they are stable identifiers -- unlike the human
+# wording of a message, they are part of this tool's contract.
+CATEGORIES: list[str] = []
 NOTES: list[str] = []
 
+# Exit codes. See the module docstring; the short version is that 1 is a
+# statement about the lock and 2 is a statement about the run.
+EXIT_OK = 0
+EXIT_MISMATCH = 1
+EXIT_INCOMPLETE = 2
 
-def problem(msg: str) -> None:
+CAT_STRUCTURE = "structure"      # the offline invariants: tampering / corruption
+CAT_UNRESOLVED = "unresolved"    # the live re-resolution could not finish
+CAT_DRIFT = "drift"              # a resolved revision differs from the lock
+CAT_BYTE_DIFF = "byte-diff"      # the regenerated lock is not byte-identical
+
+
+def problem(msg: str, category: str = CAT_STRUCTURE) -> None:
     PROBLEMS.append(msg)
+    CATEGORIES.append(category)
 
 
 def ok(msg: str) -> None:
@@ -83,8 +135,26 @@ def ok(msg: str) -> None:
 
 
 def note(msg: str) -> None:
+    # Collected, not printed: the "== result ==" block below prints every note in
+    # one place, and printing here too showed each one twice.
     NOTES.append(msg)
-    print("  [note] %s" % msg)
+
+
+def verdict() -> tuple[int, str]:
+    """Reduce the collected problems to (exit code, label).
+
+    Precedence is deliberate: a structural failure outranks everything (it means
+    the committed bytes are wrong, which no network condition can excuse), and
+    an incomplete re-resolution outranks drift (a run that could not finish
+    proves nothing, so it must not be reported as a stale lock).
+    """
+    if not PROBLEMS:
+        return EXIT_OK, "pass"
+    if CAT_STRUCTURE in CATEGORIES:
+        return EXIT_MISMATCH, "lock-invalid"
+    if CAT_UNRESOLVED in CATEGORIES:
+        return EXIT_INCOMPLETE, "incomplete"
+    return EXIT_MISMATCH, "drift"
 
 
 def immutable(revision: str | None) -> bool:
@@ -114,11 +184,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--live",
         action="store_true",
-        help="re-resolve every moving ref over the network and compare (fresh cache)",
+        help="re-resolve every moving ref over the network and compare (fresh cache). "
+        "Advisory only: upstream branches move, so this drifts on its own. CI runs it "
+        "on a schedule and never gates on it.",
     )
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--timeout", type=int, default=45)
     ap.add_argument("--retries", type=int, default=4)
+    ap.add_argument(
+        "--findings-file",
+        metavar="PATH",
+        help=(
+            "write every finding to PATH as a self-contained, bounded report "
+            "(verdict, exit code, one tagged block per problem). Lets a caller "
+            "render findings without parsing this tool's console output, and "
+            "without truncating them."
+        ),
+    )
     args = ap.parse_args(argv)
 
     print("== structural checks ==")
@@ -247,24 +329,58 @@ def main(argv: list[str] | None = None) -> int:
             if unresolved:
                 problem(
                     "live re-resolution left %d project(s) unresolved: %s"
-                    % (len(unresolved), ", ".join(unresolved[:8]))
+                    % (len(unresolved), ", ".join(unresolved[:UNRESOLVED_SHOWN]))
+                    + (
+                        " ... and %d more not shown here (see the full log)."
+                        % (len(unresolved) - UNRESOLVED_SHOWN)
+                        if len(unresolved) > UNRESOLVED_SHOWN
+                        else ""
+                    ),
+                    CAT_UNRESOLVED,
                 )
             committed = {p.get("path"): p.get("revision") for p in projects}
             drift = []
             for r in records:
+                # A record that could not be resolved is NOT evidence that
+                # upstream moved. Before this exclusion it fell through to
+                # `orig_revision` (a moving ref like refs/heads/main), which
+                # could never equal the committed SHA, so every network flake
+                # manufactured a phantom drift entry -- and the "regenerated
+                # lock differs" diff below was equally fictional. An incomplete
+                # run is now reported as incomplete (exit 2) instead.
+                if r.get("status") == "unresolved":
+                    continue
                 want = committed.get(r["path"])
                 got = r["locked_revision"] or r["orig_revision"]
                 if want != got:
                     drift.append("%s: committed %s, upstream now %s" % (r["path"], want, got))
             if drift:
+                shown = drift[:DRIFT_SHOWN]
                 problem(
                     "%d project revision(s) drifted from the committed lock:\n      %s\n"
                     "    Upstream branches moved, or the lock was edited by hand. Re-cut the lock:\n"
                     "      python tools/manifest/resolve-manifest-lock.py"
-                    % (len(drift), "\n      ".join(drift[:12]))
+                    % (len(drift), "\n      ".join(shown))
+                    + (
+                        "\n      ... and %d more drifted project(s) not shown here "
+                        "(see the full log)." % (len(drift) - len(shown))
+                        if len(drift) > len(shown)
+                        else ""
+                    ),
+                    CAT_DRIFT,
                 )
             else:
-                ok("every resolved revision matches the committed lock")
+                # Say which of the two this is. "Every resolved revision matches"
+                # is literally true on a run where nothing resolved, and reading
+                # it as a pass is exactly the mistake exit 2 exists to prevent.
+                if unresolved:
+                    note(
+                        "every revision that DID resolve matches the committed lock "
+                        "(%d unresolved - see above; this run proves nothing)"
+                        % len(unresolved)
+                    )
+                else:
+                    ok("every resolved revision matches the committed lock")
 
             out_xml = os.path.join(tmp, "rerun.xml")
             resolver.emit_xml(man, records, lock_pin or resolver.PIN, out_xml)
@@ -278,21 +394,75 @@ def main(argv: list[str] | None = None) -> int:
                 a = committed_bytes.decode("utf-8", "replace").splitlines()
                 b = fresh.decode("utf-8", "replace").splitlines()
                 diff = list(difflib.unified_diff(a, b, "committed", "regenerated", lineterm="", n=1))
+                shown_diff = diff[:DIFF_LINES_SHOWN]
                 problem(
                     "regenerated lock differs from the committed lock:\n      %s"
-                    % "\n      ".join(diff[:20])
+                    % "\n      ".join(shown_diff)
+                    + (
+                        "\n      ... diff continues (%d more line(s) not shown here; "
+                        "see the full log)." % (len(diff) - len(shown_diff))
+                        if len(diff) > len(shown_diff)
+                        else ""
+                    ),
+                    CAT_BYTE_DIFF,
                 )
 
     print("== result ==")
     for n in NOTES:
         print("  [note] %s" % n)
+    code, label = verdict()
     if PROBLEMS:
-        for p in PROBLEMS:
-            print("  [FAIL] %s" % p, file=sys.stderr)
-        print("\nLOCK VERIFICATION FAILED (%d problem(s))" % len(PROBLEMS), file=sys.stderr)
-        return 1
-    print("LOCK VERIFICATION PASSED")
-    return 0
+        for msg, cat in zip(PROBLEMS, CATEGORIES):
+            print("  [FAIL] %s" % msg, file=sys.stderr)
+        print(
+            "\nLOCK VERIFICATION FAILED (%d problem(s), verdict=%s, exit=%d)"
+            % (len(PROBLEMS), label, code),
+            file=sys.stderr,
+        )
+    else:
+        print("LOCK VERIFICATION PASSED")
+
+    if args.findings_file:
+        write_findings(args.findings_file, code, label)
+    return code
+
+
+def write_findings(path: str, code: int, label: str) -> None:
+    """Write the complete finding set to ``path``.
+
+    Deliberately a self-contained document rather than something the caller has
+    to carve out of the console log with a grep: that is what made the CI
+    classifier fragile (it pattern-matched human wording) and what truncated
+    findings mid-diff (``head -40``). Every problem is emitted in full, tagged
+    with its category, and the lists inside a problem are bounded at the point
+    they are built -- with an explicit "... N more" line whenever a bound bites,
+    so a reader can never mistake a partial report for a complete one.
+    """
+    out: list[str] = [
+        "X1 lock verification findings",
+        "verdict: %s" % label,
+        "exit-code: %d" % code,
+        "problems: %d" % len(PROBLEMS),
+    ]
+    if CATEGORIES:
+        seen: list[str] = []
+        for c in CATEGORIES:
+            if c not in seen:
+                seen.append(c)
+        out.append("categories: %s" % ", ".join(seen))
+    out.append("")
+    if not PROBLEMS:
+        out.append("No problems found.")
+    for msg, cat in zip(PROBLEMS, CATEGORIES):
+        out.append("[%s] %s" % (cat, msg))
+        out.append("")
+    for n in NOTES:
+        out.append("[note] %s" % n)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(out).rstrip() + "\n")
 
 
 if __name__ == "__main__":
