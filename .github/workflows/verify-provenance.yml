@@ -8,23 +8,77 @@ name: verify-provenance
 #   2. the lock or the coverage report is hand-edited, or upstream branches move,
 #      so the committed lock no longer describes what would actually be built.
 #
-# This job fails loudly on either. It is network-only and needs no VM, no QEMU and
-# no repo sync, so it runs on a stock GitHub-hosted runner in a couple of minutes.
+# WHY THIS FILE HAS TWO JOBS, AND WHY ONLY ONE OF THEM BLOCKS
+#   Those two failure modes are NOT the same kind of event, and gating on both is
+#   what used to make this workflow useless:
+#
+#     (1) is tampering. The captured manifests and the lock are committed bytes.
+#         A change to either is a real integrity failure, it is always caused by
+#         something in THIS repository, and it must stop a push.
+#
+#     (2) is time passing. The live re-resolution re-derives every moving ref
+#         (`upstream="main"`, ~297 of them) from the network. Bliss/LineageOS
+#         advance those branches continuously - that is the normal state of a
+#         maintained ROM tree, and it is precisely why X1 had to freeze them in
+#         the first place. So this check was going to go red on its own, and every
+#         contributor would be blocked until the owner re-cut the lock. Observed
+#         2026-09-28: five external/chromium-webview/* refs had moved, turning
+#         this workflow red for a change nobody had made here.
+#
+#   So the gate is split by what the signal actually means:
+#
+#     manifest-lock        BLOCKING. Offline, deterministic, no network. Runs on
+#                          every push and PR. This is the integrity check.
+#     lock-reproducibility ADVISORY. Runs on a schedule and on manual dispatch
+#                          only. It reports drift; it can never fail the run.
+#
+#   Note the drift is NOT a build risk. tools/guest-build/build-from-manifest.sh
+#   installs the frozen lock as repo's ACTIVE manifest and syncs the immutable
+#   SHAs, so an upstream branch moving neither changes nor breaks what gets
+#   built. Re-cutting the lock is a provenance decision (it moves the M2 X2
+#   anchor and invalidates docs/evidence/M2/x1-lock-reproducibility.txt), so it
+#   stays an owner's call rather than an automatic consequence of a red X.
+#
+# Nothing here needs a VM, QEMU, or a repo sync, so both jobs run on a stock
+# GitHub-hosted runner in a couple of minutes.
 
 on:
   push:
     branches: ['**']
   pull_request:
+  # Nightly, 04:17 UTC. Deliberately off the hour: scheduled workflows queue on
+  # GitHub's side, and :00 is the most contended slot.
+  schedule:
+    - cron: '17 4 * * *'
   workflow_dispatch:
+    inputs:
+      live:
+        description: 'Also run the advisory live re-resolution'
+        type: boolean
+        default: true
+        required: false
+      workers:
+        description: 'Parallel git ls-remote workers for the live re-resolution'
+        type: string
+        default: '16'
+        required: false
 
 permissions:
   contents: read
 
+# event_name is in the key so a nightly run cannot cancel an in-flight push
+# check (a schedule run resolves github.ref to the default branch, which would
+# otherwise collide with a push to main).
 concurrency:
-  group: verify-provenance-${{ github.ref }}
+  group: verify-provenance-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # BLOCKING. The integrity gate. Offline, no network, no moving parts.
+  # Job id `manifest-lock` is unchanged so any branch-protection required check
+  # pointing at it keeps resolving.
+  # ---------------------------------------------------------------------------
   manifest-lock:
     name: manifest capture + X1 lock
     runs-on: ubuntu-latest
@@ -45,18 +99,182 @@ jobs:
       # The captured manifest files are the input the lock was cut from. SHA256SUMS.txt
       # is stored with CRLF line endings (it was produced on Windows), so strip CR
       # before handing it to sha256sum - otherwise the filenames gain a trailing \r.
+      # This is the anti-tampering check: it fails if anyone edits a captured manifest.
       - name: Verify the captured upstream manifest hashes
         working-directory: image/manifest/upstream
         run: |
           tr -d '\r' < SHA256SUMS.txt | sha256sum -c -
 
+      # Offline structural check: every project immutable, none unresolved, paths
+      # unique, the 1175 active-project invariant, and lock/coverage/pin agreement.
+      # Covers failure mode (1) entirely, and needs no network - so it is fast and
+      # deterministic enough to be a required check.
       - name: Verify the X1 lock (offline structural check)
         run: python3 tools/manifest/verify-lock.py
 
-      # Canonical equivalence check: re-derive every moving ref from the pinned
-      # manifest over the network, on an empty cache, and require the regenerated
-      # lock to be byte-identical to the committed one. A failure here means either
-      # the lock was corrupted/edited, or upstream moved a branch and the lock must
-      # be re-cut with: python tools/manifest/resolve-manifest-lock.py
-      - name: Verify the X1 lock against a live re-resolution
-        run: python3 tools/manifest/verify-lock.py --live --workers 16
+      # The advisory job's entire verdict is `case "$rc"` over this tool's exit
+      # code, and that contract is invisible until it is wrong: an unresolved run
+      # used to be reported as "your lock is stale". This pins the 0/1/2 contract
+      # and the workflow's handling of it with a stubbed resolver, so it needs no
+      # network and finishes in seconds. It lives in the BLOCKING job because it
+      # is deterministic and offline, exactly like the checks above it.
+      - name: Regression-test the lock verifier's exit-code contract
+        run: python3 tools/manifest/test-verify-lock.py
+
+  # ---------------------------------------------------------------------------
+  # ADVISORY. Drift detection. Never fails the run.
+  # ---------------------------------------------------------------------------
+  lock-reproducibility:
+    name: X1 lock live re-resolution (advisory)
+    # Schedule and manual dispatch only - deliberately NOT on push or pull_request,
+    # which is the whole point of the split.
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.live) }}
+    runs-on: ubuntu-latest
+    # Resolving ~297 refs over the network. 40 min leaves headroom for a slow or
+    # partially-rate-limited evening without letting a hung run burn a runner.
+    timeout-minutes: 40
+    # Belt and braces: even an infrastructure error (runner eviction, a timeout
+    # kill) must not red the run. The step below also exits 0 explicitly, so this
+    # only ever fires for failures we did not anticipate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Re-resolve every moving ref and report drift
+        env:
+          WORKERS: ${{ inputs.workers || '16' }}
+        run: |
+          # Intentionally no `set -e`: the whole point of this step is to run a
+          # check that is EXPECTED to be able to fail, and still report cleanly.
+          set -uo pipefail
+
+          log="$RUNNER_TEMP/verify-lock-live.log"
+          findings="$RUNNER_TEMP/verify-lock-findings.txt"
+          : > "$findings"
+
+          # Sentinel: anything other than the tool's own 0/1/2 means "the check did
+          # not produce a result". Without it, a command that failed to even start
+          # would hand back a non-zero PIPESTATUS that the case below would read as
+          # a real verdict -- and this step would then publish a provenance claim
+          # about a run that never happened. Fail closed instead.
+          rc=99
+
+          # ${WORKERS:-16}, not "$WORKERS": an empty workflow_dispatch input would
+          # otherwise trip `set -u`. Note that the expansion happens in the
+          # pipeline's subshell, so an unbound variable kills only that subshell and
+          # the parent carries on -- which is exactly how a dead run once looked
+          # like a drift. Default it here and keep the sentinel as the backstop.
+          python3 tools/manifest/verify-lock.py --live --workers "${WORKERS:-16}" \
+            --findings-file "$findings" 2>&1 | tee "$log"
+          rc="${PIPESTATUS[0]}"
+
+          # CLASSIFICATION IS BY EXIT CODE, NOT BY TEXT.
+          #
+          # verify-lock.py's contract (its module docstring is the authority):
+          #   0 = pass
+          #   1 = the lock does not match: a structural failure, or live drift
+          #   2 = the re-resolution could not finish (unresolved refs)
+          #
+          # Nothing below inspects the tool's wording, so rewording a message -
+          # or a brand-new finding type appearing - cannot silently mislabel a
+          # run. Any other code means the contract itself changed; that is
+          # reported as `error` rather than guessed at.
+          case "$rc" in
+            0) verdict="pass" ;;
+            1) verdict="drift" ;;
+            2) verdict="incomplete" ;;
+            *) verdict="error" ;;
+          esac
+
+          # A drift or incomplete claim is only credible if the tool actually ran
+          # and wrote its report. If it did not, say so instead of publishing the
+          # verdict the exit code happened to suggest. Checked AFTER the case, and
+          # logged after this, so the log never shows a verdict that was retracted.
+          if [ "$rc" != 0 ] && [ ! -s "$findings" ]; then
+            verdict="error"
+            echo "no findings report was written - the check did not complete"
+          fi
+          echo "verdict: $verdict (exit $rc)"
+
+          {
+            echo "### X1 lock live re-resolution"
+            echo
+            case "$verdict" in
+              pass)
+                echo "**PASS** (exit 0) - the committed lock re-derives byte-for-byte from the"
+                echo "pinned upstream right now. Nothing to do."
+                ;;
+              drift)
+                echo "**DRIFT** (exit 1) - advisory only; this run is not failed."
+                echo
+                echo "Upstream branches moved since the lock was cut. This is **not** a"
+                echo "build blocker: \`build-from-manifest.sh\` syncs the frozen lock's immutable"
+                echo "SHAs, so what gets built is unaffected."
+                echo
+                echo "Re-cutting is optional and is an owner's decision, because it moves the M2"
+                echo "X2 provenance anchor:"
+                echo '```'
+                echo "python tools/manifest/resolve-manifest-lock.py"
+                echo '```'
+                ;;
+              incomplete)
+                echo "**INCOMPLETE** (exit 2) - advisory only; this run is not failed."
+                echo
+                echo "The re-resolution could not finish, so it proves **nothing** about the"
+                echo "lock. This is a network/remote problem, **not** evidence of drift, and it"
+                echo "outranks drift in the exit code precisely so the two are never confused."
+                echo
+                echo "**Do not re-cut the lock on the strength of this run.** Re-run it from the"
+                echo "Actions tab. If it keeps reporting exit 2, the refs that failed are listed"
+                echo "in the findings below."
+                ;;
+              error)
+                echo "**UNEXPECTED** (exit $rc) - advisory only; this run is not failed."
+                echo
+                echo "verify-lock.py returned an exit code this workflow does not know (0/1/2)."
+                echo "The tool's contract changed, or it failed to start. Treat the findings"
+                echo "below as unclassified and read the log before acting on anything."
+                ;;
+            esac
+            echo
+            echo "<details><summary>Findings (complete, verbatim from the tool)</summary>"
+            echo
+            echo '```'
+            # Rendered straight from the tool's own report. The previous version
+            # rebuilt this with a grep over "^ *\[FAIL\]" plus head -40, which both
+            # coupled the summary to human-facing text and cut the byte-diff off
+            # mid-hunk with no marker. verify-lock.py bounds each finding where it
+            # is built and states how many entries it omitted, so emitting the file
+            # whole is complete AND self-describing - no truncation here, ever.
+            if [ -s "$findings" ]; then
+              cat "$findings"
+            else
+              echo "(the findings report was not produced - raw log tail follows)"
+              tail -60 "$log"
+            fi
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$verdict" in
+            pass)
+              echo "::notice title=lock re-resolution::Live re-resolution passed; the committed lock still re-derives byte-for-byte."
+              ;;
+            drift)
+              echo "::warning title=lock drift (advisory)::Upstream moved since the lock was cut (exit 1). Not a build blocker - the build syncs the frozen lock's immutable SHAs. Re-cutting is optional and moves the M2 X2 provenance anchor."
+              ;;
+            incomplete)
+              echo "::warning title=re-resolution incomplete (advisory)::The live re-resolution could not finish (exit 2) - it did NOT show drift. Nothing is proven; do not re-cut the lock on this run. Re-run from the Actions tab."
+              ;;
+            error)
+              echo "::warning title=re-resolution unclassified (advisory)::verify-lock.py returned exit $rc, which is not one of 0/1/2. Check the step log before acting on anything."
+              ;;
+          esac
+
+          # Always green. Drift is reported, never enforced, here.
+          exit 0

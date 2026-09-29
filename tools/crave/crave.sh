@@ -28,9 +28,18 @@
 #
 # Usage (the -n is implicit; any other crave arguments pass straight through):
 #   bash tools/crave/crave.sh list
-#   bash tools/crave/crave.sh run --projectID 36 --platform linux64 --no-patch --detached \
-#     -- "bash -c 'git clone --depth=1 https://github.com/IamAzmathullaShaikh/EmberbirdOS.git && cd EmberbirdOS && bash tools/guest-build/build-from-manifest.sh'"
-#   bash tools/crave/crave.sh pull image/out/
+#   bash tools/crave/crave.sh run --projectID 36 --platform linux16 --no-patch --detached \
+#     -- "<remote command>"
+#   bash tools/crave/crave.sh pull eb/image/out/
+#
+# Do NOT hand-roll a `crave run` for this repository. The client resolves the project from
+# the git URL of the current directory, and this repo's URL is not a Crave project, so a
+# run from here fails with "could not get project information". `run-remote-build.sh` is the
+# supported entry point: it launches from a ticket checkout whose origin is the base
+# project's URL, merges crave.yaml into it, pins the exact commit, and enforces Crave's
+# one-build-per-account rule. Platform is not a free choice either - project 36 accepts
+# linux16 and rejects linux32/linux64/linux-all/linux-t2d-32 with "Invalid platform for
+# project" (probe matrix: docs/M2-CRAVE-BUILD.md).
 #
 # Env: CRAVE_BIN overrides the client path.
 

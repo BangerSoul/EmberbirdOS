@@ -7,7 +7,10 @@
 #   client which project to use instead, so every command in docs/M2-CRAVE-BUILD.md works
 #   from a plain checkout with no per-invocation flags:
 #
-#     bash tools/crave/crave.sh run --platform linux64 --no-patch --detached -- "<cmd>"
+#     bash tools/crave/run-remote-build.sh run   # creates/refreshes the ticket, pins the commit
+#
+#   (Platform is not a free choice: project 36 accepts linux16 and rejects linux32/linux64/
+#   linux-all/linux-t2d-32 with "Invalid platform for project" - see docs/M2-CRAVE-BUILD.md.)
 #
 #   Crave does not require this file to be committed to take effect, but committing it is
 #   what makes the remote build reproducible for anyone who clones the repo - the same

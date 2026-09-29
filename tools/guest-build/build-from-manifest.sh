@@ -240,9 +240,13 @@ MANIFEST_XML
   # abort that silently left projects unmaterialized cannot recur. But a pre-seeded Crave
   # tree was synced for the BASE project (LOS 20); when we re-point .repo at our lock,
   # resync.sh prunes/optimizes and can still report "synchronized successfully" while the
-  # ~379 Bliss delta projects that LOS 20 never had (bootable/aaropa among them) are
+  # Bliss delta projects that LOS 20 never had (bootable/aaropa among them) are
   # absent on disk. `repo manifest -r` then dies with a raw FileNotFoundError on the first
   # missing path.
+  #
+  # How many are missing is a property of the node's pre-seeded tree, not a constant
+  # (measured: 137 active projects absent from LOS 20's manifest on 2026-09-29). The loop
+  # below computes the real set, so the count is only ever reported, never assumed.
   #
   # The OLD guard walked `repo list -p`, which is itself derived from what repo has on
   # disk / in its project list - so a project that never materialized could be absent

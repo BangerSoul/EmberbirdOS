@@ -14,10 +14,10 @@
 > **301767** on project `LOS 22.1` id 93, platform `linux16`
 > <https://foss.crave.io/app/#/build/info/301767?team=14>). It is recorded as **queued**, and
 > as of this writing it has not run: it sits in the **free build queue** waiting for a
-> node (the free queue costs no tokens — `crave run` without `--platform` — so this is a
-> queue-position wait, **not** a token/compute gate). The launch path is therefore proven end to end up to the
-> queue, and X2 stays OPEN until an artifact comes back, is re-hashed locally and is
-> recorded under `docs/evidence/M2/`. See
+> node. The launcher submits with `--platform linux16`, whose listed token rate is **0** —
+> the free tier — so this is a queue-position wait, **not** a token/compute gate. The
+> launch path is therefore proven end to end up to the queue, and X2 stays OPEN until an
+> artifact comes back, is re-hashed locally and is recorded under `docs/evidence/M2/`. See
 > [Executed 2026-09-24](#executed-2026-09-24-what-the-run-actually-required) for the exact
 > findings, including the client defect that blocked the first attempt.
 
@@ -223,10 +223,10 @@ checkout in the launcher.
 **4. The build runs on the free queue; the wait is queue position, not a token gate.**
 `crave list`'s `Tokens Per Second` column is each platform's **cost** (`build_tokens_per_second`),
 not a balance — `aosp-silver` shows 16 because it *costs* 16 tokens/sec, and the `0`s are
-platforms whose cost is not published to this account. The free queue (`crave run` with **no**
-`--platform`) costs zero tokens and is what this build uses, so an empty wallet does not block
-it: `crave wallet transactions` returns *No transactions found for this user*, and that is
-expected for a free-queue job. Two free-queue jobs on `linux16` — the probe (301688, since
+the free tier. The launcher submits on `--platform linux16`, whose rate is 0, so it is on
+that free queue and an empty wallet does not block it: `crave wallet transactions` returns
+*No transactions found for this user*, and that is expected. Two free-queue jobs on
+`linux16` — the probe (301688, since
 stopped) and the build (301689) — both sat `queued`, with the log repeating `Waiting for build
 job <id> to run`; that is a wait for a free build node, not a compute allocation. (Update:
 301689 was cancelled — one account runs one job at a time — and the build relaunched on
