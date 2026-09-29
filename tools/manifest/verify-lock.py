@@ -68,6 +68,7 @@ import re
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -227,7 +228,10 @@ def main(argv: list[str] | None = None) -> int:
         ok("no project is flagged emberbird-unresolved")
 
     paths = [p.get("path") for p in projects]
-    dupes = sorted({x for x in paths if paths.count(x) > 1})
+    # Counter, not paths.count(x) in a comprehension: counting inside a loop is
+    # O(n^2) and the lock is re-checked on every push.
+    path_counts = Counter(paths)
+    dupes = sorted({x for x in paths if path_counts[x] > 1})
     if dupes:
         problem("duplicate project paths in the lock: %s" % ", ".join(dupes[:8]))
     else:

@@ -377,9 +377,15 @@ if (-not $script:QemuExe)                 { throw 'qemu-system-x86_64.exe not fo
 if (-not $script:OvmfCodeResolved)        { throw 'OVMF firmware not found. Pass -OvmfCode / -OvmfVars. Run -Check for details.' }
 if (-not $script:OvmfVarsResolved)        { throw 'OVMF_VARS template not found. Pass -OvmfVars. Run -Check for details.' }
 
-$whpx = Get-WhpxStatus
-if (-not $NoAccel -and -not $whpx.HypervisorPresent) {
-    throw 'WHPX unavailable (no running hypervisor). Enable Windows Hypervisor Platform + reboot, or pass -NoAccel for slow software boot.'
+# The WHPX probe is the slowest thing in this script (Get-WindowsOptionalFeature
+# queries the component store, and Get-CimInstance is another WMI round trip), and it
+# gates only an actual launch. -DryRun just assembles and prints a command line, so run
+# the probe on the boot path only - a preview must not cost seconds to render.
+if (-not $DryRun) {
+    $whpx = Get-WhpxStatus
+    if (-not $NoAccel -and -not $whpx.HypervisorPresent) {
+        throw 'WHPX unavailable (no running hypervisor). Enable Windows Hypervisor Platform + reboot, or pass -NoAccel for slow software boot.'
+    }
 }
 
 $imagePath  = (Resolve-Path -LiteralPath $Image).Path

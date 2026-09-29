@@ -160,7 +160,22 @@ function Invoke-FetchPlatformTools {
     Info ("sha256: {0}" -f $hash)
 
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
-    Expand-Archive -LiteralPath $zip -DestinationPath $parent -Force
+    # .NET's ZipFile instead of Expand-Archive, which is very slow over platform-tools'
+    # thousands of entries (it walks the archive per entry and writes progress output).
+    # The destination was just removed, so -Force's overwrite behaviour is not needed.
+    # Fall back to Expand-Archive on a host where the compression assembly is absent.
+    $zipApi = $null
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zipApi = [System.IO.Compression.ZipFile]
+    } catch {
+        $zipApi = $null
+    }
+    if ($zipApi) {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $parent)
+    } else {
+        Expand-Archive -LiteralPath $zip -DestinationPath $parent -Force
+    }
     Remove-Item -LiteralPath $zip -Force
 
     $adb = Join-Path $Destination 'adb.exe'
