@@ -88,3 +88,9 @@ desktop.ini
 .env
 .env.*
 secrets/
+
+# Crave API key. docs/M2-CRAVE-BUILD.md says to keep this in $HOME and never copy it
+# into the tree; that is a human rule, and it was the only thing standing between an
+# account API key and a commit. This is the net under it - a crave.conf that does land
+# in the checkout is not committable.
+crave.conf
