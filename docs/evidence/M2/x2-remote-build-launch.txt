@@ -1,6 +1,9 @@
 # M2 X2 - remote build launch: observed evidence
-# Captured 2026-09-24 on DESKTOP-C993H9Q (Windows 11 Pro 10.0.26300), from a checkout of
-# github.com/IamAzmathullaShaikh/EmberbirdOS.
+# Captured 2026-09-24 on DESKTOP-C993H9Q (Windows 11 Pro 10.0.26300), from a working
+# checkout of EmberbirdOS. The capture predates the move of the canonical remote to
+# github.com/BangerSoul/EmberbirdOS (the operator was on the personal-fork checkout at the
+# time); the measurements below are of the Crave client and its queue, not of the remote's
+# owner, so they carry over. Current origin: BangerSoul/EmberbirdOS.
 #
 # This file records what the launch attempt actually produced. X2 is NOT closed by this
 # file: no artifact exists, so no hash is claimed. It exists so the blocker is a measured
@@ -95,8 +98,16 @@
   crave wallet transactions -> "No transactions found for this user."
 
 # No job ever left the queue, and only the platform that cannot be submitted shows a
-# non-zero token rate. That is consistent with a compute/token allocation gate on the
-# account, which is an owner-side action and not something this repository can change.
+# non-zero token rate.
+#
+# SUPERSEDED INFERENCE (corrected 2026-09-29, kept above verbatim as the original reading).
+# The "Tokens Per Second" column is each platform's token COST per second, not a balance or
+# an allocation: aosp-silver is the paid tier (16) and it is the one platform that cannot
+# even be submitted, while the 0s are the free tier this account's build is queued on. So
+# the empty wallet is expected for a free-queue job, and the jobs sitting `queued` were
+# waiting for a free build node - a queue-position wait, not a compute/token gate. The
+# aosp-silver submission error is a separate wallet-not-linked precondition (admin-side).
+# See docs/M2-CRAVE-BUILD.md "Executed 2026-09-24" item 4 for the corrected reading.
 
 === 6. Consequence ============================================================
 # X2 stays OPEN. No artifact, no SHA-256, no pull. The launch path itself is proven up to
