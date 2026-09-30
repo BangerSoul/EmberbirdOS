@@ -341,15 +341,74 @@ else
 fi
 
 # ------------------------------------------------------------------- build ---
-log "build: lunch $LUNCH_TARGET && make $MAKE_TARGET"
+# envsetup.sh is NOT at a fixed path. A classic AOSP/Lineage tree has it at
+# build/envsetup.sh, but this lock is an Android-12-era Bliss x86 tree in which
+# build/ already holds soong, blueprint, bazel and pesto as sibling projects, so
+# platform_build is pinned at build/make and envsetup.sh is build/make/envsetup.sh.
+# Crave job 302572 queued for 23h, synced all 1175 projects, passed the X1 lock
+# check, and then died on a hardcoded `source build/envsetup.sh` for exactly this
+# reason. Ask the lock we already verified, then fall back to both known layouts.
+ENVSETUP=""
+lock_build_path="$(sed -n 's/.*name="platform_build"[^>]*path="\([^"]*\)".*/\1/p' \
+  "$REPO_ROOT/image/manifest/arcadia-x86.pinned.xml" 2>/dev/null | head -1)" || lock_build_path=""
+for cand in "$lock_build_path" build build/make; do
+  [ -n "$cand" ] || continue
+  if [ -f "$WORKSPACE/$cand/envsetup.sh" ]; then
+    ENVSETUP="$cand/envsetup.sh"
+    break
+  fi
+done
+[ -n "$ENVSETUP" ] || die "no envsetup.sh in the synced tree (lock says platform_build at '${lock_build_path:-<unresolved>}'; also tried build/ and build/make/) - the AOSP build system did not land on disk."
+
+# The lunch combo and the goal are the recipe's last two hardcoded assumptions, so
+# they get the same treatment as the envsetup path: prove the manifest-backed tree
+# actually provides them BEFORE the build starts, instead of discovering it after a
+# 23h queue plus a full sync. Which device trees even exist is read out of the lock,
+# never guessed - `device/generic/x86_64` ships in both AOSP and BlissRoms-x86, and
+# only the BlissRoms-x86 one declares bliss_x86_64 (AOSP's declares aosp_x86_64), so
+# a lock that resolved that path to the wrong remote would silently break `lunch`.
+log "preflight: the manifest-backed tree provides $LUNCH_TARGET"
+PRODUCT="${LUNCH_TARGET%%-*}"   # bliss_x86_64-userdebug -> bliss_x86_64
+lock_device_paths="$(sed -n 's/.*path="\(device\/[^"]*\)".*/\1/p' \
+  "$REPO_ROOT/image/manifest/arcadia-x86.pinned.xml" 2>/dev/null)" || lock_device_paths=""
+[ -n "$lock_device_paths" ] || die "no device/ projects in the lock - cannot confirm $LUNCH_TARGET exists; refusing to start a build that cannot lunch."
+product_mk=""
+combo_mk=""
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  mk="$WORKSPACE/$p/AndroidProducts.mk"
+  [ -f "$mk" ] || continue
+  # A product is offered iff its makefile is listed in PRODUCT_MAKEFILES.
+  grep -q "$PRODUCT\.mk" "$mk" || continue
+  product_mk="$mk"
+  # Newer trees also gate the combo: a product can exist for `make` while the exact
+  # <product>-<variant> lunch pair is not offered.
+  if grep -qE "^[[:space:]]*$LUNCH_TARGET[[:space:]]*$" "$mk"; then
+    combo_mk="$mk"
+  fi
+  break
+done <<<"$lock_device_paths"
+if [ -z "$product_mk" ]; then
+  die "the synced tree offers no product '$PRODUCT' for LUNCH_TARGET='$LUNCH_TARGET' (scanned the $(printf '%s' "$lock_device_paths" | grep -c . ) device/ trees the lock declares, looking for '$PRODUCT.mk' in AndroidProducts.mk). The lock and LUNCH_TARGET disagree - fix one of them; do not build."
+fi
+if [ -z "$combo_mk" ]; then
+  echo "note: '$LUNCH_TARGET' is not in COMMON_LUNCH_CHOICES in $product_mk; lunch may still resolve it by product name"
+fi
+# The make goal is deliberately NOT pre-checked: an unknown goal costs make a second
+# to reject, and after the sync has already happened that is the cheap failure. The
+# lunch combo is the expensive-to-diagnose one, because a wrong combo and a missing
+# device tree look identical from the outside.
+printf '  product makefile: %s\n' "$product_mk"
+
+log "build: source $ENVSETUP && lunch $LUNCH_TARGET && make $MAKE_TARGET"
 cd "$WORKSPACE"
 # shellcheck disable=SC1091
-source build/envsetup.sh
+source "$ENVSETUP"
 lunch "$LUNCH_TARGET"
 make -j"$JOBS" "$MAKE_TARGET"
 
 log "SBOM (best effort - not every tree supports it)"
-if ! ( source build/envsetup.sh && lunch "$LUNCH_TARGET" && m sbom ) >/dev/null 2>&1; then
+if ! ( source "$ENVSETUP" && lunch "$LUNCH_TARGET" && m sbom ) >/dev/null 2>&1; then
   echo "note: 'm sbom' unavailable in this tree; SBOM will be generated at release time (M1 section 7)"
 fi
 
