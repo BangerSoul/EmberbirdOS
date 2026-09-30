@@ -27,6 +27,8 @@
 #   * tools/checks/test-manifest-resolver.py  - the X1 lock generator itself
 #   * tools/checks/test-build-recipe.py       - the build recipe's embedded Python,
 #     its artifact discovery, and the completeness constants it shares with the lock
+#   * tools/checks/test-revision-audit.sh - the recipe's on-disk revision audit
+#     (HEAD vs the lock) on synthetic git repos: clean, drifted, missing, moved tag
 #   * tools/checks/check-powershell-static.py - ASCII purity, delimiter pairing, and
 #     the two shipped scripts' deliberate performance properties
 #   * shellcheck over the shell scripts, when it is installed (informational only)
@@ -255,6 +257,7 @@ run "X1 lock: offline structural verification"   python3 tools/manifest/verify-l
 run "X1 lock: verifier exit-code contract"       python3 tools/manifest/test-verify-lock.py
 run "X1 lock: generator unit tests"              python3 tools/checks/test-manifest-resolver.py
 run "build recipe: offline tests"                python3 tools/checks/test-build-recipe.py
+run "build recipe: revision audit behaviour"     bash tools/checks/test-revision-audit.sh
 run "PowerShell: static checks"                  python3 tools/checks/check-powershell-static.py
 run "shellcheck (informational)"                 check_shellcheck
 

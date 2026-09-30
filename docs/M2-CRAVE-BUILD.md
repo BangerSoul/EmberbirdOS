@@ -242,6 +242,47 @@ a node**, not "denied compute". Machine-level analysis: `~/.crave/CRAVE-COMPUTE-
 OPEN; when a job does run, `pull` brings back `x2-provenance.json` plus the image, the local
 re-hash is compared against the record, and only then is the M2 appendix row filled in.
 
+## Executed 2026-09-30: job 302748 ran and FAILED (the pre-seeded-tree trap, now closed)
+
+Job **302748** (`0fc8173`, the fix for the failure below) queued ~11h and FAILED in
+**3m56s** — and this time the recipe caught it, in the preflight this repo added after
+302572:
+
+```
+== preflight: the manifest-backed tree provides bliss_x86_64-userdebug
+FATAL: the synced tree offers no product 'bliss_x86_64' for LUNCH_TARGET='bliss_x86_64-userdebug'
+```
+
+The failure is deeper than a wrong lunch target, and the runbook's own "sync is the
+canonical provenance step" claim did not hold on this node:
+
+- The Crave node's workspace is **pre-seeded with LOS 20**. Most of the 1175 active lock
+  paths already existed on disk — but at **LOS 20's revisions**, not the lock's.
+- `resync.sh` treats an existing checkout as done, so only genuinely-missing paths were
+  fetched. The completeness check tested **directory existence only**, and `repo manifest
+  -r` + `LOCK VERIFICATION PASSED` verified manifest-level agreement, not content. The
+  recipe's log even showed the tell: `Syncing: 0% (0/137)` for the delta set.
+- `verify-lock.py` is **file-level** (lock ↔ coverage ↔ pin agreement); it never inspects
+  the node's disk. Net: roughly a thousand shared projects were on disk at the wrong
+  revisions, and only the new lunch preflight noticed the tree was not ours.
+
+A third job (**302852**) was briefly submitted before the audit fix was committed. It
+pinned `0fc8173` — the already-failed revision — because the fix existed only in the
+local working tree, and the remote `git fetch`es its recipe commit from GitHub. It was
+stopped within minutes; the lesson is a runbook rule: **commit and push the recipe fix
+BEFORE `run`** — `run` pins `git HEAD`, and nothing uncommitted reaches the node.
+
+Closed in the same session as this note: the recipe now runs a **revision audit** after
+sync — every project's on-disk `HEAD` is compared against the lock (tag pins resolved to
+commit SHAs via `^{commit}`), anything drifted or missing is re-synced with
+`repo sync -l --force-sync <paths>`, and a second failing audit stops the build. The
+audit's behaviour is pinned offline by `tools/checks/test-revision-audit.sh`
+(clean / wrong-SHA / no-checkout / moved-tag / repair, against synthetic git repos).
+
+Nothing was pulled (pull only runs on success), so there is still no image and no
+`x2-provenance.json`, and **X2 stays OPEN**. A third submission is needed; the audit plus
+the two prior failures mean the next run either builds or names a real, external fault.
+
 ## Executed 2026-09-30: job 302572 ran and FAILED (fixed, not resubmitted)
 
 Job **302572** (`eade8aa`, project 36 / `linux16`) was submitted 2026-09-29T07:16Z and

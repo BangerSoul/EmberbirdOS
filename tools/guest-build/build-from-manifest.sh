@@ -330,6 +330,144 @@ PY
   fi
   log "sync complete: all $total active manifest projects present on disk"
 
+  # Revision audit - presence is NOT content.
+  #
+  # Job 302572 (2026-09-29): every active path existed on disk, LOCK VERIFICATION
+  # PASSED, and the tree was still LOS 20 content. This node is PRE-SEEDED with
+  # LOS 20: ~1000 of the 1175 lock projects were already checked out at LOS 20's
+  # revisions, resync.sh treats an existing checkout as done, and the
+  # directory-existence check above cannot see the difference. verify-lock.py is
+  # file-level (lock/coverage/pin agreement) and never inspects this disk. So
+  # compare every synced project's on-disk HEAD against the lock itself (tag pins
+  # resolved to commit SHAs), re-sync exactly what drifted, and re-audit. This is
+  # the check that would have failed 302572 in seconds instead of at `lunch`.
+  revision_audit() {
+    # Writes a bounded report to $1 (first line: "OK ...", "MISSING n" or
+    # "MISMATCH n"; one "missing <path> ..."/"mismatch <path> ..." line per
+    # offender), echoes the first line to stdout for the build log, and exits
+    # nonzero when anything on disk disagrees with the lock.
+    LOCK_XML="$LOCK_XML" WORKSPACE="$WORKSPACE" python3 - "$1" <<'PY' || return $?
+import os, subprocess, sys, xml.etree.ElementTree as ET
+
+try:
+    sys.stdout.reconfigure(newline="\n")
+except (AttributeError, ValueError):
+    pass
+
+ws = os.environ["WORKSPACE"]
+root = ET.parse(os.environ["LOCK_XML"]).getroot()
+
+rows = []
+tag_refs = set()
+for p in root.findall("project"):
+    groups = {g.strip() for g in (p.get("groups") or "").split(",") if g.strip()}
+    if "notdefault" in groups:
+        continue
+    path = p.get("path") or p.get("name")
+    rev = p.get("revision") or ""
+    rows.append((path, rev, "tag" if rev.startswith("refs/tags/") else "sha"))
+    if rev.startswith("refs/tags/"):
+        tag_refs.add(rev)
+
+# Tag pins do not name their commit, so resolve every distinct tag somewhere in
+# the tree and require one consistent commit wherever the tag exists.
+tag_commit = {}
+for path, _, _ in rows:
+    if not os.path.exists(os.path.join(ws, path, ".git")):
+        continue
+    for ref in sorted(tag_refs - set(tag_commit)):
+        try:
+            out = subprocess.run(
+                ["git", "-C", os.path.join(ws, path), "rev-parse", ref + "^{commit}"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.returncode == 0 and out.stdout.strip():
+            tag_commit[ref] = out.stdout.strip()
+    if len(tag_commit) == len(tag_refs):
+        break
+
+missing = []
+mismatch = []
+for path, rev, kind in rows:
+    if not os.path.exists(os.path.join(ws, path, ".git")):
+        missing.append(path)
+        continue
+    try:
+        out = subprocess.run(
+            ["git", "-C", os.path.join(ws, path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        mismatch.append((path, "rev-parse failed: %s" % exc))
+        continue
+    if out.returncode != 0:
+        mismatch.append((path, "rev-parse failed"))
+        continue
+    head = out.stdout.strip()
+    want = tag_commit.get(rev) if kind == "tag" else rev
+    if not want:
+        mismatch.append((path, "lock pins %s but no project in the tree has that tag" % rev))
+    elif head != want:
+        mismatch.append((path, "on-disk %s, locked %s (%s)" % (head[:12], want[:12], rev[:28])))
+
+lines = []
+if not missing and not mismatch:
+    lines.append("OK all %d active projects on disk at their locked revisions" % len(rows))
+else:
+    if missing:
+        lines.append("MISSING %d (no checkout at all)" % len(missing))
+        lines.extend("missing %s (directory has no .git)" % path for path in missing)
+    if mismatch:
+        lines.append("MISMATCH %d (checkout content differs from the lock)" % len(mismatch))
+        lines.extend("mismatch %s %s" % (path, why) for path, why in mismatch)
+
+report = sys.argv[1] if len(sys.argv) > 1 else "-"
+text = "\n".join(lines) + "\n"
+if report == "-":
+    sys.stdout.write(text)
+else:
+    with open(report, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    # First line to the build log as well, so the remote log is self-describing.
+    print(lines[0])
+sys.exit(0 if not missing and not mismatch else 3)
+PY
+  }
+
+  log "revision audit: every on-disk project HEAD must match the lock"
+  audit_out="$OUT_DIR/revision-audit.txt"
+  if revision_audit "$audit_out"; then
+    printf '  %s\n' "$(head -1 "$audit_out")"
+  else
+    mapfile -t drifted_paths < <(sed -n 's/^\(missing\|mismatch\) \([^ ]*\) .*/\2/p' "$audit_out" | sort -u)
+    printf '  %s\n' "$(head -1 "$audit_out")"
+    # Guard against the worst possible failure mode of this parser: an empty path
+    # list handed to `repo sync` is NOT a no-op - it means a FULL re-sync of all
+    # 1175 projects, the multi-hundred-GB step the Crave rule forbids. If the
+    # report yielded no paths, that is a bug in the audit's report format; stop.
+    if [ "${#drifted_paths[@]}" -eq 0 ]; then
+      die "revision audit failed but the report named no per-project paths (see $audit_out) - refusing to run an unscoped repo sync; fix the report format."
+    fi
+    log "re-syncing ${#drifted_paths[@]} project(s) whose checkout content differs from the lock"
+    # Try local-only first (instant if the workspace happens to hold the objects),
+    # then fall back to a TARGETED network sync. The fallback matters because this
+    # workspace was seeded with --depth=1 at LOS 20's revisions: the lock's SHAs
+    # are simply not present as local objects there, so -l cannot satisfy them.
+    # Either way the sync is scoped to the drifted paths only - never full-tree.
+    if ! repo sync -l --force-sync "${drifted_paths[@]}"; then
+      log "local-only sync could not satisfy the locked revisions (expected on a depth-1 pre-seeded tree) - falling back to a targeted network sync of the same paths"
+      repo sync -c -j"$SYNC_JOBS" --no-manifest-update --no-tags --force-sync "${drifted_paths[@]}" \
+        || die "re-sync of the drifted projects failed (see above). The locked revisions must be fetchable from their remotes; if a pinned SHA is unreachable upstream, re-cut the lock (tools/manifest/resolve-manifest-lock.py)."
+    fi
+    if ! revision_audit "$audit_out"; then
+      printf '  %s\n' "$(head -1 "$audit_out")"
+      die "on-disk revisions STILL disagree with the lock after a forced re-sync (full report: $audit_out) - refusing to build a tree that is not the locked one."
+    fi
+    printf '  %s\n' "$(head -1 "$audit_out")"
+  fi
+
   log "canonical check: repo manifest -r against the committed X1 lock"
   repo manifest -r -o "$OUT_DIR/repo-manifest-r.xml" \
     || die "repo manifest -r failed - the synced tree is missing or cannot resolve a project the frozen lock references (see the sync-completeness step above), so the canonical X1 witness cannot be produced."
