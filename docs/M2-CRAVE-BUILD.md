@@ -242,6 +242,61 @@ a node**, not "denied compute". Machine-level analysis: `~/.crave/CRAVE-COMPUTE-
 OPEN; when a job does run, `pull` brings back `x2-provenance.json` plus the image, the local
 re-hash is compared against the record, and only then is the M2 appendix row filled in.
 
+## Executed 2026-09-30: job 302572 ran and FAILED (fixed, not resubmitted)
+
+Job **302572** (`eade8aa`, project 36 / `linux16`) was submitted 2026-09-29T07:16Z and
+**FAILED**. It is the first job that got past the queue, so the numbers below are real:
+
+| stage | result |
+| --- | --- |
+| queue | ~23h (free tier, 0 tokens/sec) |
+| node execution | 8m44s total |
+| `repo sync` | all 1175 active manifest projects on disk; `repo sync has finished successfully` |
+| X1 lock check | `LOCK VERIFICATION PASSED` (all structural + coverage cross-checks OK) |
+| `lunch`/`make` | **died before compiling anything** |
+
+The failure was one line of the recipe, and it was the recipe's fault, not the lock's:
+
+```
+tools/guest-build/build-from-manifest.sh: line 347: build/envsetup.sh: No such file or directory
+Build Failed: returned 1
+```
+
+This lock is an Android-12-era Bliss x86 tree, so `build/` already holds `soong`,
+`blueprint`, `bazel` and `pesto` as sibling projects; `platform_build` is pinned at
+**`build/make`**, and that is where `envsetup.sh` lives. The recipe hardcoded the classic
+`source build/envsetup.sh`. It now resolves the path from the committed lock first, then
+probes `build/` and `build/make/`, and dies with an explicit message if none exists;
+`tools/checks/test-build-recipe.py` pins that so the class of bug cannot come back.
+
+Nothing was pulled: `pull` only runs on success, so there is no image and no
+`x2-provenance.json`, and **X2 stays OPEN**. A resubmitted job is needed to actually
+compile the guest — expect another ~23h queue before any build time at all.
+
+Two things the job proved that are worth keeping: `bliss_x86_64-userdebug` really is
+provided by the manifest-backed tree (`device/generic/x86_64` from BlissRoms-x86, pinned
+at `e763b4e`, lists it in `COMMON_LUNCH_CHOICES` alongside `bliss_x86_64.mk` in
+`PRODUCT_MAKEFILES`), and the manifest graph itself is trustworthy — the sync and the X1
+lock check both passed on a real node. What failed was only the recipe's hardcoded
+assumption about where that tree puts things.
+
+So the recipe no longer keeps such assumptions private. Before it builds it now asserts,
+against the committed lock, that the tree provides what it is about to ask for:
+
+- the `envsetup.sh` path comes from the lock's `platform_build` path;
+- the `device/` trees it scans for the product come from the lock, never a literal list;
+- `LUNCH_TARGET`'s product must appear in some `AndroidProducts.mk`'s
+  `PRODUCT_MAKEFILES`, and the exact `<product>-<variant>` pair is checked against
+  `COMMON_LUNCH_CHOICES` — a mismatch dies in seconds with the paths it scanned,
+  instead of after a queue and a full sync.
+
+The `make` goal is deliberately not pre-checked: an unknown goal costs `make` about a
+second to reject, which after the sync has already happened is the cheap failure.
+
+A benign warning to ignore: repo prints `remote origin does not have refs/heads/master`
+during sync (the `eb/` source checkout is fetched by SHA, not by branch). The sync
+completes and the completeness check passes regardless.
+
 ## Honest limitations
 
 - **Launched, not completed.** A Crave run needs your account, an API key and compute; the

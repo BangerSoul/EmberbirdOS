@@ -295,6 +295,118 @@ def test_expected_count_agrees(root: str, active: int) -> None:
         )
 
 
+def test_envsetup_path() -> None:
+    """The recipe must not hardcode `source build/envsetup.sh`.
+
+    Crave job 302572 queued for 23 hours, synced all 1175 projects, passed the X1
+    lock check, and then died on `build/envsetup.sh: No such file or directory`.
+    This lock is an Android-12-era Bliss x86 tree in which build/ already holds
+    soong, blueprint, bazel and pesto as siblings, so platform_build is pinned at
+    build/make and envsetup.sh is build/make/envsetup.sh. That is exactly the class
+    of bug this suite exists to catch: the expensive half cannot run here, so the
+    cheap source-level invariants have to.
+    """
+    print("== build: envsetup path is resolved, not hardcoded ==")
+    text = read(RECIPE)
+
+    hardcoded = re.findall(r"^\s*(?:source|\.)\s+build/envsetup\.sh", text, re.M)
+    check(
+        "the recipe never sources a literal build/envsetup.sh",
+        not hardcoded,
+        "found %d hardcoded source build/envsetup.sh line(s)" % len(hardcoded),
+    )
+    check(
+        "the recipe resolves the platform_build path out of the committed lock",
+        "platform_build" in text and "envsetup.sh" in text,
+        "expected a lookup of platform_build's path plus a probe for envsetup.sh",
+    )
+    check(
+        "both known AOSP layouts are probed",
+        '"$lock_build_path" build build/make' in text,
+        "expected the candidate list to offer the lock path, build/ and build/make/",
+    )
+    check(
+        "a tree with no envsetup.sh dies with an explicit message",
+        re.search(r"no envsetup\.sh in the synced tree", text) is not None,
+        "expected the resolver to die rather than source a missing file",
+    )
+
+    # The resolver must pick the layout the committed lock actually describes, and
+    # the lock really does describe build/make - so this is a live assertion about
+    # the tree we are about to build, not just about the text of the recipe.
+    root = ET.parse(LOCK_XML).getroot()
+    build_paths = [
+        (proj.get("path") or proj.get("name"))
+        for proj in root.findall("project")
+        if (proj.get("name") or "").replace("/", "_") == "platform_build"
+    ]
+    check(
+        "the lock pins platform_build somewhere the resolver looks",
+        len(build_paths) == 1 and build_paths[0] in ("build", "build/make"),
+        "lock says platform_build -> %r" % (build_paths,),
+    )
+
+
+def test_lunch_target_is_manifest_backed() -> None:
+    """The lunch target and the device tree that provides it must agree.
+
+    `device/generic/x86_64` exists in AOSP *and* in BlissRoms-x86, and only the
+    BlissRoms-x86 one declares bliss_x86_64 (AOSP's declares aosp_x86_64). So a lock
+    that resolved that path to the wrong remote produces a tree where `lunch
+    bliss_x86_64-userdebug` cannot possibly resolve - which is precisely the kind of
+    mismatch that should be caught here rather than after a 23h queue and a sync.
+    """
+    print("== lunch target is provided by the manifest-backed tree ==")
+    text = read(RECIPE)
+
+    check(
+        "the recipe reads the device/ trees out of the lock",
+        'path="\\(device' in text and "lock_device_paths" in text,
+        "expected the candidate device trees to come from the lock, not a literal list",
+    )
+    check(
+        "the recipe derives the product name from LUNCH_TARGET",
+        'PRODUCT="${LUNCH_TARGET%%-*}"' in text,
+        "expected the product to be split off the <product>-<variant> lunch target",
+    )
+    check(
+        "the recipe dies when the tree offers no such product",
+        re.search(r"offers no product", text) is not None,
+        "expected a hard failure before the build, not a fallback",
+    )
+    check(
+        "the recipe checks the full lunch combo, not just the product",
+        'grep -qE "^[[:space:]]*$LUNCH_TARGET[[:space:]]*$"' in text,
+        "expected COMMON_LUNCH_CHOICES to be consulted for the exact combo",
+    )
+
+    root = ET.parse(LOCK_XML).getroot()
+    x86_64 = [
+        proj
+        for proj in root.findall("project")
+        if (proj.get("path") or "") == "device/generic/x86_64"
+    ]
+    check(
+        "the lock pins device/generic/x86_64 exactly once",
+        len(x86_64) == 1,
+        "found %d entries" % len(x86_64),
+    )
+    if x86_64:
+        remote = x86_64[0].get("remote")
+        remotes = {r.get("name"): (r.get("fetch") or "") for r in root.findall("remote")}
+        fetch = remotes.get(remote, "")
+        check(
+            "that device tree comes from BlissRoms-x86, not AOSP",
+            "BlissRoms-x86" in fetch,
+            "remote=%r fetch=%r - AOSP's tree has no bliss_x86_64 lunch combo" % (remote, fetch),
+        )
+        check(
+            "the pinned device tree is an immutable revision",
+            re.fullmatch(r"[0-9a-f]{40}", x86_64[0].get("revision") or "") is not None,
+            "revision=%r" % (x86_64[0].get("revision"),),
+        )
+
+
 def main() -> int:
     print("EmberbirdOS - build-from-manifest.sh offline tests")
     print()
@@ -326,6 +438,9 @@ def main() -> int:
             test_lock_heredoc(lock_body, tmp, active)
             test_evidence_heredoc(evidence_body, tmp)
         test_expected_count_agrees(tmp, active)
+
+    test_envsetup_path()
+    test_lunch_target_is_manifest_backed()
 
     print()
     print("== summary ==")
