@@ -6,10 +6,16 @@
 #   2. a checkout at the wrong SHA is a MISMATCH (exit 3), naming the path;
 #   3. a directory with no .git is MISSING (exit 3);
 #   4. a tag-pinned project whose tag has moved past HEAD is a MISMATCH;
-#   5. repairing every drift audits clean again.
+#   5. repairing every drift audits clean again;
+#   6. sanitize_worktrees() clears local modifications/untracked files that would
+#      make the forced re-sync's checkout abort.
 # WHY: job 302748 (2026-09-30) died at `lunch` because the Crave node's pre-seeded
 # tree held ~1000 lock paths at LOS 20 revisions while every other check in the
-# recipe reasoned about existence and files only.
+# recipe reasoned about existence and files only. Job 302857 (2026-10-01) then died
+# mid-re-sync: the pre-seeded image ships prebuilts/clang/host/linux-x86 with
+# locally-modified tracked files, and a forced checkout refuses to overwrite them
+# ("Your local changes ... would be overwritten by checkout"), so one dirty
+# worktree failed a 1063-project re-sync.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -136,6 +142,40 @@ case "$(head -1 "$R5")" in
   "OK all 4"*) echo "  [PASS] repaired tree audits clean again";;
   *) echo "  [FAIL] repaired tree: $(head -1 "$R5")"; fail=1;;
 esac
+
+echo "-- 6. sanitize the local state a forced checkout would abort on"
+# Model job 302857: the pre-seeded image ships prebuilts/clang/host/linux-x86 with
+# tracked files modified in place, and `repo sync --force-sync` applies the locked
+# revision with a checkout that refuses to overwrite them ("Your local changes ...
+# would be overwritten by checkout") - one dirty worktree failed a 1063-project
+# re-sync. sanitize_worktrees must reset tracked modifications and drop untracked
+# files; a path with no .git (a missing checkout repo materializes from scratch)
+# is skipped, not an error.
+gitrepo dirty >/dev/null
+printf 'locked\n' > "$WORKSPACE/dirty/locked.txt"
+git -C "$WORKSPACE/dirty" add locked.txt
+git -C "$WORKSPACE/dirty" -c user.email=t@t -c user.name=t commit -q -m locked
+printf 'local modification\n' > "$WORKSPACE/dirty/locked.txt"   # damage: tracked file modified
+printf 'untracked\n'           > "$WORKSPACE/dirty/stray.txt"   # damage: untracked file
+mkdir -p "$WORKSPACE/nogit"                                     # no .git at all
+if sanitize_worktrees "$WORKSPACE" dirty nogit; then
+  echo "  [PASS] sanitize_worktrees exits 0"
+else
+  echo "  [FAIL] sanitize_worktrees returned nonzero"
+  fail=1
+fi
+[ -z "$(git -C "$WORKSPACE/dirty" status --porcelain)" ] \
+  && echo "  [PASS] worktree is pristine afterwards" \
+  || { echo "  [FAIL] worktree still dirty:"; git -C "$WORKSPACE/dirty" status --porcelain | sed 's/^/         /'; fail=1; }
+[ "$(cat "$WORKSPACE/dirty/locked.txt")" = "locked" ] \
+  && echo "  [PASS] tracked modification discarded (locked content restored)" \
+  || { echo "  [FAIL] tracked file still holds the local modification"; fail=1; }
+[ -e "$WORKSPACE/dirty/stray.txt" ] \
+  && { echo "  [FAIL] untracked file survived sanitize"; fail=1; } \
+  || echo "  [PASS] untracked file removed"
+[ -d "$WORKSPACE/nogit" ] \
+  && echo "  [PASS] checkout without .git skipped, left alone" \
+  || { echo "  [FAIL] nogit directory disappeared"; fail=1; }
 
 echo
 if [ "$fail" = 0 ]; then

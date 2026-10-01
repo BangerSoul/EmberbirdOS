@@ -242,6 +242,56 @@ a node**, not "denied compute". Machine-level analysis: `~/.crave/CRAVE-COMPUTE-
 OPEN; when a job does run, `pull` brings back `x2-provenance.json` plus the image, the local
 re-hash is compared against the record, and only then is the M2 appendix row filled in.
 
+## Executed 2026-10-01: job 302857 ran and FAILED (the audit worked; a dirty worktree broke the repair)
+
+Job **302857** (`4ea22c2`, project 36 / `linux16`, submitted 2026-09-30 ~18:53Z) left the
+queue after ~16h, ran **7m14s**, and FAILED — but the failure is a different, much more
+specific one: the **revision audit from the 302748 fix fired and scoped the repair
+correctly**, and the forced re-sync then tripped over the Crave base image's own local
+modifications. In order, the remote log shows:
+
+- `resync.sh` again reported success without updating anything — the audit afterwards
+  printed `MISMATCH 1063 (checkout content differs from the lock)`, i.e. 1063 of the 1175
+  active projects were still on disk at LOS 20 revisions. The pre-seeded-tree trap is
+  exactly as diagnosed after 302748; what changed is that one line turns it from a silent
+  mixed tree into an explicit, scoped repair.
+- The scoped repair tried `repo sync -l --force-sync <1063 paths>` (failed — expected on a
+  depth-1 pre-seeded tree: the locked objects are not local) and then the targeted network
+  sync of the **same 1063 paths** — never a full-tree sync.
+- The network sync fetched for ~4m45s and then died on **one** project:
+
+  ```
+  error: Your local changes to the following files would be overwritten by checkout:
+          clang-r450784d/bin/clang++.real
+          clang-r450784d/bin/clang-14
+  Please commit your changes or stash them before you switch branches.
+  Aborting
+  error: prebuilts/clang/host/linux-x86/: platform/prebuilts/clang/host/linux-x86 checkout 78f0ef650b213157b62c0cbf57034808eae3dca9
+  FATAL: re-sync of the drifted projects failed (see above). ...
+  ```
+
+Root cause: `repo sync` applies a revision with `git read-tree -m -u`, which **refuses to
+overwrite locally-modified tracked files**, and `--force-sync` forces the *git dir*, never
+the *worktree*. The Crave base image ships `prebuilts/clang/host/linux-x86` with those two
+clang binaries modified in place, so one dirty file failed an otherwise-working
+1063-project re-sync.
+
+Fix (this commit): before the forced sync the recipe now runs `sanitize_worktrees()` over
+**every drifted path** — `git reset --hard` (discard tracked modifications) plus
+`git clean -fd` (drop untracked files that would equally block the checkout). That is the
+correct direction for a provenance build: the tree must equal the lock exactly, so nothing
+outside the lock may survive into it. Paths without `.git` (missing checkouts — `repo sync`
+materializes those from scratch) are skipped, not errors. Pinned offline by scenario 6 of
+`tools/checks/test-revision-audit.sh` (dirty tracked file + untracked file + a no-`.git`
+path, asserting the worktree is left pristine).
+
+Confirmed while diagnosing (and worth not re-litigating): the committed lock's revisions
+are **882 `refs/tags/*` + 301 40-hex SHAs, zero branch names**, so the audit's tag
+resolution covers every pin kind that exists; and the audit's MISMATCH count agreeing with
+repo's 1063-project sync list says the comparison is measuring exactly what the sync acts
+on. Nothing was pulled (pull only runs on success), so there is still no image and no
+`x2-provenance.json`, and **X2 stays OPEN**.
+
 ## Executed 2026-09-30: job 302748 ran and FAILED (the pre-seeded-tree trap, now closed)
 
 Job **302748** (`0fc8173`, the fix for the failure below) queued ~11h and FAILED in

@@ -436,6 +436,34 @@ sys.exit(0 if not missing and not mismatch else 3)
 PY
   }
 
+  # Force each drifted project's worktree back to a pristine state before the
+  # forced re-sync. $1 = workspace root; the remaining args are project paths.
+  #
+  # WHY (job 302857, 2026-10-01): the targeted network re-sync of 1063 drifted
+  # projects ran to 90%+ and then died on ONE project:
+  #   prebuilts/clang/host/linux-x86/: error: Your local changes to the following
+  #   files would be overwritten by checkout: clang-r450784d/bin/clang++.real,
+  #   clang-r450784d/bin/clang-14 ... Aborting
+  # The Crave base image ships that project with locally-modified tracked files;
+  # `repo sync` applies a revision with `git read-tree -m -u`, which refuses to
+  # overwrite local modifications - and `--force-sync` only forces the GIT DIR,
+  # never the worktree. One dirty file therefore fails the whole re-sync. So we
+  # `git reset --hard` (discard tracked modifications) and `git clean -fd`
+  # (remove untracked files that would equally block the checkout) first. Both
+  # are correct for a provenance build: the tree must equal the lock exactly, so
+  # nothing outside the lock may survive into it. Missing checkouts (no .git)
+  # have nothing to clean and are skipped - `repo sync` materializes those from
+  # scratch.
+  sanitize_worktrees() {
+    local ws="$1"; shift
+    local p
+    for p in "$@"; do
+      [ -e "$ws/$p/.git" ] || continue
+      git -C "$ws/$p" reset -q --hard HEAD || return 1
+      git -C "$ws/$p" clean -qfd || return 1
+    done
+  }
+
   log "revision audit: every on-disk project HEAD must match the lock"
   audit_out="$OUT_DIR/revision-audit.txt"
   if revision_audit "$audit_out"; then
@@ -451,6 +479,11 @@ PY
       die "revision audit failed but the report named no per-project paths (see $audit_out) - refusing to run an unscoped repo sync; fix the report format."
     fi
     log "re-syncing ${#drifted_paths[@]} project(s) whose checkout content differs from the lock"
+    # The checkout below aborts on any local modification or untracked file that
+    # collides with the locked revision (job 302857), so clear those first.
+    sanitize_worktrees "$WORKSPACE" "${drifted_paths[@]}" \
+      || die "could not sanitize a drifted worktree (git reset --hard / git clean failed - see the project above); refusing to run a forced sync whose checkout would abort."
+    printf '  sanitized %s drifted worktree(s) (local modifications/untracked files discarded)\n' "${#drifted_paths[@]}"
     # Try local-only first (instant if the workspace happens to hold the objects),
     # then fall back to a TARGETED network sync. The fallback matters because this
     # workspace was seeded with --depth=1 at LOS 20's revisions: the lock's SHAs
