@@ -244,9 +244,10 @@ re-hash is compared against the record, and only then is the M2 appendix row fil
 
 ## Executed 2026-10-01: job 302857 ran and FAILED (the audit worked; a dirty worktree broke the repair)
 
-Job **302857** (`4ea22c2`, project 36 / `linux16`, submitted 2026-09-30 ~18:53Z) left the
-queue after ~16h, ran **7m14s**, and FAILED — but the failure is a different, much more
-specific one: the **revision audit from the 302748 fix fired and scoped the repair
+Job **302857** (`4ea22c2`, project 36 / `linux16`) was submitted 2026-09-30 ~18:53Z, last
+confirmed `queued` at 19:53Z, and found finished (FAILED) on 2026-10-01T10:47Z — so it
+queued overnight in the same ~11–23h free-tier band as the prior jobs. It ran **7m14s**,
+and the failure is a different, much more specific one: the **revision audit from the 302748 fix fired and scoped the repair
 correctly**, and the forced re-sync then tripped over the Crave base image's own local
 modifications. In order, the remote log shows:
 
@@ -291,6 +292,10 @@ resolution covers every pin kind that exists; and the audit's MISMATCH count agr
 repo's 1063-project sync list says the comparison is measuring exactly what the sync acts
 on. Nothing was pulled (pull only runs on success), so there is still no image and no
 `x2-provenance.json`, and **X2 stays OPEN**.
+
+Resubmitted 2026-10-01 as job **303004**, pinned to `ded56c9` — this fix. Verified the
+queued payload from `list --json` (`jobs_active[0].workspace.cmd` names the commit): the
+plain-text `crave list` table can show a stale payload, so JSON is the check that counts.
 
 ## Executed 2026-09-30: job 302748 ran and FAILED (the pre-seeded-tree trap, now closed)
 
