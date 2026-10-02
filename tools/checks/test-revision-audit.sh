@@ -7,8 +7,11 @@
 #   3. a directory with no .git is MISSING (exit 3);
 #   4. a tag-pinned project whose tag has moved past HEAD is a MISMATCH;
 #   5. repairing every drift audits clean again;
-#   6. sanitize_worktrees() clears local modifications/untracked files that would
-#      make the forced re-sync's checkout abort.
+#   6. two projects sharing ONE tag, each on its own target, are BOTH clean;
+#   7. sanitize_worktrees() clears local modifications/untracked files that would
+#      make the forced re-sync's checkout abort;
+#   8. sanitize_worktrees() survives a checkout whose HEAD never landed;
+#   9. the audit judges against a stubbed `repo manifest -r` when one is supplied.
 # WHY: job 302748 (2026-09-30) died at `lunch` because the Crave node's pre-seeded
 # tree held ~1000 lock paths at LOS 20 revisions while every other check in the
 # recipe reasoned about existence and files only. Job 302857 (2026-10-01) then died
@@ -16,22 +19,38 @@
 # locally-modified tracked files, and a forced checkout refuses to overwrite them
 # ("Your local changes ... would be overwritten by checkout"), so one dirty
 # worktree failed a 1063-project re-sync.
+# Scenario 6 covers the trap behind that count: AOSP release tags are per-
+# repository commits and 872 of this lock's 1175 active projects pin
+# refs/tags/android-12.1.0_r22, so an audit that resolves a tag inside one project
+# and then compares every project sharing it against that single commit reports
+# hundreds of phantom drifts - and, because no sync can make one repository's tag
+# resolve to another's commit, it can then never pass its own re-audit.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-audit.sh
 source "$HERE/lib-audit.sh"
+# Fixtures below create revisions. Most environments can; a sandboxed one may refuse
+# that subcommand, in which case lib-fixtures.sh installs a plumbing-backed shim so
+# the suite still audits a real tree instead of a field of unborn HEADs.
+# shellcheck source=lib-fixtures.sh
+source "$HERE/lib-fixtures.sh"
 
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
+emberbird_ensure_git_record "$T" || {
+  echo "FATAL: cannot obtain a git that records revisions; fixtures would be meaningless" >&2
+  exit 1
+}
+printf '== fixtures (git that records revisions: %s) ==\n' "$EMBERBIRD_GIT_RECORD"
 export WORKSPACE="$T/ws" LOCK_XML="$T/lock.xml"
-mkdir -p "$WORKSPACE"
 
 fail=0
-run() { # $1 = expected exit, $2 = report file
+run() { # $1 = expected exit, $2 = report file, $3.. = extra args to revision_audit
   local want="$1" rep="$2" rc
+  shift 2
   set +e
-  revision_audit "$rep"
+  revision_audit "$rep" "$@"
   rc=$?
   set -e
   if [ "$rc" = "$want" ]; then
@@ -42,14 +61,27 @@ run() { # $1 = expected exit, $2 = report file
   fi
 }
 
-gitrepo() { # $1 = path under ws; prints the resulting HEAD sha
+gitrepo() { # $1 = path under ws, $2 = optional message; prints the resulting HEAD sha
   mkdir -p "$WORKSPACE/$1"
   git -C "$WORKSPACE/$1" init -q
-  git -C "$WORKSPACE/$1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+  git -C "$WORKSPACE/$1" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "${2:-init}"
   git -C "$WORKSPACE/$1" rev-parse HEAD
 }
 
-echo "== fixtures =="
+echo "-- 0. the fixture git records a real, resolvable HEAD"
+# The rest of this file is only meaningful if the fixtures ended up with actual
+# revisions on disk. Under a shim (or a broken ambient git) every repo would be left
+# with an unborn HEAD, the audit would report each one as `rev-parse failed`, and the
+# scenarios below would "fail" for a reason that has nothing to do with the audit.
+mkdir -p "$WORKSPACE"
+probe="$(gitrepo probe_selfcheck)"
+if [ "$(git -C "$WORKSPACE/probe_selfcheck" rev-parse HEAD 2>/dev/null)" = "$probe" ] \
+   && [ "${#probe}" -eq 40 ]; then
+  echo "  [PASS] fixture HEAD resolves to a full sha ($probe)"
+else
+  echo "  [FAIL] fixture git did not record a resolvable revision (got '$probe')"
+  exit 1
+fi
 # Every active project exists at its locked revision from the start, so scenario 1
 # is genuinely clean; later scenarios damage exactly one project each.
 SHA_OK="$(gitrepo ok)"
@@ -57,6 +89,18 @@ SHA_WRONG="$(gitrepo wrong)"
 SHA_GONE="$(gitrepo gone)"
 SHA_TAG="$(gitrepo tagged)"
 git -C "$WORKSPACE/tagged" tag "android-13.0.0_r30" HEAD
+# Two projects pinned to the SAME tag, each checked out at the commit its OWN
+# repository tags - which is what one shared AOSP release tag actually means.
+# Distinct messages give them distinct commits; identical ones collapse into a
+# single object and the scenario would pass for the wrong reason.
+SHA_SHARED_A="$(gitrepo shared_a "release in shared_a")"
+SHA_SHARED_B="$(gitrepo shared_b "release in shared_b")"
+if [ "$SHA_SHARED_A" = "$SHA_SHARED_B" ]; then
+  echo "FATAL: shared-tag fixtures collapsed into one commit - scenario 6 is meaningless" >&2
+  exit 1
+fi
+git -C "$WORKSPACE/shared_a" tag "android-12.1.0_r22" "$SHA_SHARED_A"
+git -C "$WORKSPACE/shared_b" tag "android-12.1.0_r22" "$SHA_SHARED_B"
 
 cat > "$LOCK_XML" <<XML
 <?xml version="1.0" encoding="UTF-8"?>
@@ -65,6 +109,8 @@ cat > "$LOCK_XML" <<XML
   <project name="p_wrong" path="wrong" revision="$SHA_WRONG" />
   <project name="p_gone" path="gone" revision="$SHA_GONE" />
   <project name="p_tag" path="tagged" revision="refs/tags/android-13.0.0_r30" />
+  <project name="p_shared_a" path="shared_a" revision="refs/tags/android-12.1.0_r22" />
+  <project name="p_shared_b" path="shared_b" revision="refs/tags/android-12.1.0_r22" />
   <project name="p_skip" path="skipped" revision="refs/tags/android-12.1.0_r22" groups="notdefault" />
 </manifest>
 XML
@@ -75,7 +121,7 @@ echo "-- 1. clean tree"
 R1="$T/r1.txt"
 run 0 "$R1"
 case "$(head -1 "$R1")" in
-  "OK all 4 active projects"*) echo "  [PASS] OK over the 4 active (notdefault skipped)";;
+  "OK all 6 active projects"*) echo "  [PASS] OK over the 6 active (notdefault skipped)";;
   *) echo "  [FAIL] first line: $(head -1 "$R1")"; fail=1;;
 esac
 grep -q '^skipped' "$R1" && { echo "  [FAIL] notdefault project leaked into the report"; fail=1; } \
@@ -139,11 +185,30 @@ git -C "$WORKSPACE/tagged" tag -f "android-13.0.0_r30" "$SHA_TAG" >/dev/null
 R5="$T/r5.txt"
 run 0 "$R5"
 case "$(head -1 "$R5")" in
-  "OK all 4"*) echo "  [PASS] repaired tree audits clean again";;
+  "OK all 6"*) echo "  [PASS] repaired tree audits clean again";;
   *) echo "  [FAIL] repaired tree: $(head -1 "$R5")"; fail=1;;
 esac
 
-echo "-- 6. sanitize the local state a forced checkout would abort on"
+echo "-- 6. one tag shared by two repositories"
+# shared_a and shared_b are each checked out at the commit their OWN repo tags,
+# which is exactly what `refs/tags/android-12.1.0_r22` means in a lock. A tag
+# resolved once in shared_a and reused for shared_b would flag shared_b as drifted
+# no matter what any sync does.
+R6="$T/r6.txt"
+run 0 "$R6"
+case "$(head -1 "$R6")" in
+  "OK all 6"*) echo "  [PASS] both projects sharing one tag audit clean";;
+  *) echo "  [FAIL] shared tag: $(head -1 "$R6")"; fail=1;;
+esac
+if grep -q '^mismatch shared_' "$R6"; then
+  echo "  [FAIL] a project was judged against another repository's tag commit:"
+  sed 's/^/         /' "$R6"
+  fail=1
+else
+  echo "  [PASS] neither project compared against the other's tag commit"
+fi
+
+echo "-- 7. sanitize the local state a forced checkout would abort on"
 # Model job 302857: the pre-seeded image ships prebuilts/clang/host/linux-x86 with
 # tracked files modified in place, and `repo sync --force-sync` applies the locked
 # revision with a checkout that refuses to overwrite them ("Your local changes ...
@@ -176,6 +241,87 @@ fi
 [ -d "$WORKSPACE/nogit" ] \
   && echo "  [PASS] checkout without .git skipped, left alone" \
   || { echo "  [FAIL] nogit directory disappeared"; fail=1; }
+
+echo "-- 8. sanitize a checkout whose HEAD never landed"
+# A project whose .git exists but holds no commit is reported by the audit as
+# `rev-parse failed`, and the recipe routes it straight into sanitize_worktrees.
+# `git reset --hard HEAD` dies on an unborn HEAD, and failing there would kill the
+# very `repo sync` that rebuilds the checkout - so the sanitizer has to let it
+# through while still clearing whatever debris the half-finished fetch left.
+mkdir -p "$WORKSPACE/halfinit"
+git -C "$WORKSPACE/halfinit" init -q            # .git present, HEAD unborn
+printf 'untracked\n' > "$WORKSPACE/halfinit/stray.txt"
+if sanitize_worktrees "$WORKSPACE" halfinit; then
+  echo "  [PASS] sanitize_worktrees exits 0 on an unborn HEAD"
+else
+  echo "  [FAIL] sanitize_worktrees returned nonzero on an unborn HEAD"
+  fail=1
+fi
+[ -e "$WORKSPACE/halfinit/.git" ] \
+  && echo "  [PASS] the half-initialized checkout was left in place" \
+  || { echo "  [FAIL] half-initialized checkout disappeared"; fail=1; }
+[ -e "$WORKSPACE/halfinit/stray.txt" ] \
+  && { echo "  [FAIL] untracked debris survived an unborn-HEAD sanitize"; fail=1; } \
+  || echo "  [PASS] untracked debris removed even with no HEAD to reset to"
+
+echo "-- 9. the audit judges against repo's own resolution (stubbed repo manifest -r)"
+# The recipe hands the audit `repo manifest -r`, which resolves each pin the way repo
+# does. Two properties matter, and NEITHER is testable without a stub:
+#   a) a pin the project's own checkout can no longer resolve is still decidable,
+#      because repo's resolved answer stands in for it - this is the whole reason
+#      the recipe passes the witness in;
+#   b) when repo's answer disagrees with HEAD, HEAD is wrong - the audit must not
+#      rubber-stamp a tree just because a resolved manifest was supplied.
+RESOLVED="$T/resolved.xml"
+stub_resolved() { # $1 = path whose resolved revision to corrupt (optional)
+  local bad="${1:-}"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<manifest>\n'
+    printf '  <project name="ok" path="ok" revision="%s" />\n' "$SHA_OK"
+    printf '  <project name="wrong" path="wrong" revision="%s" />\n' "$SHA_WRONG"
+    printf '  <project name="gone" path="gone" revision="%s" />\n' "$SHA_GONE2"
+    printf '  <project name="p_tag" path="tagged" revision="%s" />\n' "$SHA_TAG"
+    printf '  <project name="p_shared_a" path="shared_a" revision="%s" />\n' "$SHA_SHARED_A"
+    if [ "$bad" = "shared_b" ]; then
+      printf '  <project name="p_shared_b" path="shared_b" revision="%s" />\n' "$(printf 'f%.0s' $(seq 40))"
+    else
+      printf '  <project name="p_shared_b" path="shared_b" revision="%s" />\n' "$SHA_SHARED_B"
+    fi
+    printf '</manifest>\n'
+  } > "$RESOLVED"
+}
+
+# Damage the one thing only repo's resolution can still answer: shared_b's local tag.
+git -C "$WORKSPACE/shared_b" tag -d "android-12.1.0_r22" >/dev/null
+
+R9a="$T/r9a.txt"
+run 3 "$R9a"
+if grep -q "does not resolve it" "$R9a"; then
+  echo "  [PASS] without the witness, an unresolvable local pin is undecidable"
+else
+  echo "  [FAIL] expected 'does not resolve it', got: $(head -1 "$R9a")"; fail=1
+fi
+
+stub_resolved
+R9b="$T/r9b.txt"
+run 0 "$R9b" "$RESOLVED"
+case "$(head -1 "$R9b")" in
+  "OK all 6 active projects"*) echo "  [PASS] with the witness, that same project is decidable";;
+  *) echo "  [FAIL] witness did not rescue the audit: $(head -1 "$R9b")"; fail=1;;
+esac
+case "$(head -1 "$R9b")" in
+  *"repo manifest -r"*) echo "  [PASS] the report names the yardstick it used";;
+  *) echo "  [FAIL] report does not say it used the resolved manifest"; fail=1;;
+esac
+
+stub_resolved shared_b
+R9c="$T/r9c.txt"
+run 3 "$R9c" "$RESOLVED"
+if grep -q "^mismatch shared_b " "$R9c"; then
+  echo "  [PASS] a resolved revision that disagrees with HEAD is caught"
+else
+  echo "  [FAIL] the audit accepted a tree the witness disagrees with: $(head -1 "$R9c")"; fail=1
+fi
 
 echo
 if [ "$fail" = 0 ]; then

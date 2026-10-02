@@ -13,9 +13,11 @@
 #      404 and leave the tree silently incomplete. The upstream manifests checkout is
 #      still pinned to the exact revision recorded in image/manifest/arcadia-x86.pin.json
 #      for provenance, but its moving per-project refs are no longer what repo syncs;
-#   2. re-confirm the committed X1 lock against the synced tree using
-#      `repo manifest -r` - the canonical build-side witness that the network-only
-#      resolver (tools/manifest/resolve-manifest-lock.py) is checked against;
+#   2. audit the synced tree's CONTENT against the lock - every project's on-disk HEAD
+#      against the revision `repo manifest -r` resolves for it, re-syncing and
+#      re-auditing whatever drifted - and then re-confirm the lock against that same
+#      `repo manifest -r` witness with verify-lock.py --repo-manifest, so the claim
+#      written into the provenance record below is one a check actually made;
 #   3. build the image;
 #   4. emit image/out/x2-provenance.json (sha256 + size + toolchain + revision), which
 #      is the X2 evidence record, plus a plain artifact list.
@@ -330,6 +332,28 @@ PY
   fi
   log "sync complete: all $total active manifest projects present on disk"
 
+  # Ask repo what every project resolves to, and audit against that.
+  #
+  # The lock pins 872 of its 1175 active projects to refs/tags/android-12.1.0_r22, and
+  # an AOSP release tag is a DIFFERENT commit in every repository - so a tag pin can
+  # only be settled by repo's own revision resolution, not by re-deriving one in a
+  # shell heredoc. `repo manifest -r` IS that resolution, and it is already the
+  # artifact the provenance record names as the build-side witness. Generate it once
+  # HERE, before the audit, so the audit compares on-disk HEAD against repo's answer
+  # instead of guessing (see revision_audit's $2).
+  #
+  # A failure here is not fatal: the audit falls back to resolving each pin in the
+  # project's own git dir, and the mandatory witness below still runs after any
+  # repair. So this can only ever make the audit more accurate, never unavailable.
+  log "resolving the active manifest per project (repo manifest -r)"
+  resolved_manifest="$OUT_DIR/repo-manifest-r.xml"
+  rm -f "$resolved_manifest"
+  if repo manifest -r -o "$resolved_manifest"; then
+    printf '  resolved manifest: %s\n' "$resolved_manifest"
+  else
+    echo "note: repo manifest -r could not resolve every project; the audit will resolve each pin in its own checkout instead (the mandatory witness below still runs)"
+  fi
+
   # Revision audit - presence is NOT content.
   #
   # Job 302572 (2026-09-29): every active path existed on disk, LOCK VERIFICATION
@@ -346,8 +370,14 @@ PY
     # "MISMATCH n"; one "missing <path> ..."/"mismatch <path> ..." line per
     # offender), echoes the first line to stdout for the build log, and exits
     # nonzero when anything on disk disagrees with the lock.
-    LOCK_XML="$LOCK_XML" WORKSPACE="$WORKSPACE" python3 - "$1" <<'PY' || return $?
-import os, subprocess, sys, xml.etree.ElementTree as ET
+    #
+    # $2 is optional: the `repo manifest -r` output. When it is present and a
+    # project's revision is in it, that resolved commit is the yardstick - see
+    # below. When it is absent (or does not cover a project) the pin is resolved
+    # in the project's own git dir instead, which is the same answer for every
+    # tree whose refs survived.
+    LOCK_XML="$LOCK_XML" WORKSPACE="$WORKSPACE" python3 - "$1" "${2:-}" <<'PY' || return $?
+import os, re, subprocess, sys, xml.etree.ElementTree as ET
 
 try:
     sys.stdout.reconfigure(newline="\n")
@@ -357,64 +387,96 @@ except (AttributeError, ValueError):
 ws = os.environ["WORKSPACE"]
 root = ET.parse(os.environ["LOCK_XML"]).getroot()
 
+# A 40-hex pin names its own commit, so it needs no resolution at all. Anything
+# else (a tag) has to be resolved inside the project that pins it - see below.
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+
 rows = []
-tag_refs = set()
 for p in root.findall("project"):
     groups = {g.strip() for g in (p.get("groups") or "").split(",") if g.strip()}
     if "notdefault" in groups:
         continue
     path = p.get("path") or p.get("name")
     rev = p.get("revision") or ""
-    rows.append((path, rev, "tag" if rev.startswith("refs/tags/") else "sha"))
-    if rev.startswith("refs/tags/"):
-        tag_refs.add(rev)
+    rows.append((path, rev))
 
-# Tag pins do not name their commit, so resolve every distinct tag somewhere in
-# the tree and require one consistent commit wherever the tag exists.
-tag_commit = {}
-for path, _, _ in rows:
-    if not os.path.exists(os.path.join(ws, path, ".git")):
-        continue
-    for ref in sorted(tag_refs - set(tag_commit)):
-        try:
-            out = subprocess.run(
-                ["git", "-C", os.path.join(ws, path), "rev-parse", ref + "^{commit}"],
-                capture_output=True, text=True, timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if out.returncode == 0 and out.stdout.strip():
-            tag_commit[ref] = out.stdout.strip()
-    if len(tag_commit) == len(tag_refs):
-        break
+
+def git_in(project_path, *args):
+    """Run git inside ONE project's own git dir; stripped stdout, or None."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", os.path.join(ws, project_path)] + list(args),
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+# The recipe hands us `repo manifest -r` when it could produce it. That is repo's
+# OWN revision resolution, and it is strictly better than anything re-derived here:
+# 872 of this lock's 1175 active projects are pinned to refs/tags/android-12.1.0_r22,
+# and an AOSP release tag is a DIFFERENT commit in every repository, so a tag pin can
+# only be settled by the resolution repo itself performed. Re-deriving it in a shell
+# heredoc is how this audit used to compare 872 correct projects against one arbitrary
+# repository's tag. Only entries repo actually resolved to a concrete commit are
+# taken; a revision left as a moving ref is ignored so it can never be used as a
+# yardstick (falling back is strictly better than comparing HEAD to refs/heads/*).
+resolved = {}
+resolved_arg = sys.argv[2] if len(sys.argv) > 2 else ""
+if resolved_arg and os.path.exists(resolved_arg):
+    try:
+        rroot = ET.parse(resolved_arg).getroot()
+    except ET.ParseError as exc:
+        print("note: cannot parse %s (%s); resolving pins locally instead" % (resolved_arg, exc),
+              file=sys.stderr)
+        rroot = None
+    if rroot is not None:
+        for el in rroot.findall("project"):
+            rpath = el.get("path") or el.get("name")
+            rrev = el.get("revision") or ""
+            if rpath and SHA_RE.fullmatch(rrev):
+                resolved[rpath] = rrev
+
 
 missing = []
 mismatch = []
-for path, rev, kind in rows:
+for path, rev in rows:
     if not os.path.exists(os.path.join(ws, path, ".git")):
         missing.append(path)
         continue
-    try:
-        out = subprocess.run(
-            ["git", "-C", os.path.join(ws, path), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=120,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        mismatch.append((path, "rev-parse failed: %s" % exc))
-        continue
-    if out.returncode != 0:
+    head = git_in(path, "rev-parse", "HEAD")
+    if head is None:
         mismatch.append((path, "rev-parse failed"))
         continue
-    head = out.stdout.strip()
-    want = tag_commit.get(rev) if kind == "tag" else rev
-    if not want:
-        mismatch.append((path, "lock pins %s but no project in the tree has that tag" % rev))
-    elif head != want:
+    if not rev:
+        mismatch.append((path, "lock entry carries no revision"))
+        continue
+    if path in resolved:
+        # repo resolved this pin; its answer is the lock's answer, by construction.
+        want = resolved[path]
+    elif SHA_RE.fullmatch(rev):
+        want = rev
+    else:
+        # No resolved manifest for this project: resolve the pin in the project's own
+        # git dir, which is what repo would do for it too.
+        want = git_in(path, "rev-parse", rev + "^{commit}")
+        if not want:
+            mismatch.append(
+                (path, "lock pins %s but this project's own checkout does not resolve it" % rev)
+            )
+            continue
+    if head != want:
         mismatch.append((path, "on-disk %s, locked %s (%s)" % (head[:12], want[:12], rev[:28])))
 
 lines = []
 if not missing and not mismatch:
-    lines.append("OK all %d active projects on disk at their locked revisions" % len(rows))
+    # Say which yardstick produced this verdict: "OK" means the same thing in both
+    # modes, and a reader deciding whether the tree was actually proven has to know.
+    lines.append(
+        "OK all %d active projects on disk at their locked revisions%s"
+        % (len(rows), " (resolved via repo manifest -r)" if resolved else "")
+    )
 else:
     if missing:
         lines.append("MISSING %d (no checkout at all)" % len(missing))
@@ -454,19 +516,27 @@ PY
   # nothing outside the lock may survive into it. Missing checkouts (no .git)
   # have nothing to clean and are skipped - `repo sync` materializes those from
   # scratch.
+  #
+  # A checkout whose .git exists but whose HEAD never landed (the fetch died, so
+  # the audit reported it as `rev-parse failed`) is the same case one step later:
+  # `git reset --hard HEAD` dies on an unborn HEAD, and returning nonzero here
+  # would kill the very `repo sync` that rebuilds it. So reset only when there is
+  # a HEAD to reset to, and always drop untracked debris.
   sanitize_worktrees() {
     local ws="$1"; shift
     local p
     for p in "$@"; do
       [ -e "$ws/$p/.git" ] || continue
-      git -C "$ws/$p" reset -q --hard HEAD || return 1
+      if git -C "$ws/$p" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        git -C "$ws/$p" reset -q --hard HEAD || return 1
+      fi
       git -C "$ws/$p" clean -qfd || return 1
     done
   }
 
   log "revision audit: every on-disk project HEAD must match the lock"
   audit_out="$OUT_DIR/revision-audit.txt"
-  if revision_audit "$audit_out"; then
+  if revision_audit "$audit_out" "$resolved_manifest"; then
     printf '  %s\n' "$(head -1 "$audit_out")"
   else
     mapfile -t drifted_paths < <(sed -n 's/^\(missing\|mismatch\) \([^ ]*\) .*/\2/p' "$audit_out" | sort -u)
@@ -494,7 +564,7 @@ PY
       repo sync -c -j"$SYNC_JOBS" --no-manifest-update --no-tags --force-sync "${drifted_paths[@]}" \
         || die "re-sync of the drifted projects failed (see above). The locked revisions must be fetchable from their remotes; if a pinned SHA is unreachable upstream, re-cut the lock (tools/manifest/resolve-manifest-lock.py)."
     fi
-    if ! revision_audit "$audit_out"; then
+    if ! revision_audit "$audit_out" "$resolved_manifest"; then
       printf '  %s\n' "$(head -1 "$audit_out")"
       die "on-disk revisions STILL disagree with the lock after a forced re-sync (full report: $audit_out) - refusing to build a tree that is not the locked one."
     fi
@@ -502,10 +572,18 @@ PY
   fi
 
   log "canonical check: repo manifest -r against the committed X1 lock"
-  repo manifest -r -o "$OUT_DIR/repo-manifest-r.xml" \
+  # Regenerated here, after any repair, so the witness that gates the build describes
+  # the tree that is about to be built - not the one the audit was first handed.
+  repo manifest -r -o "$resolved_manifest" \
     || die "repo manifest -r failed - the synced tree is missing or cannot resolve a project the frozen lock references (see the sync-completeness step above), so the canonical X1 witness cannot be produced."
   cd "$REPO_ROOT"
-  python3 tools/manifest/verify-lock.py || die "the synced tree does not match the committed X1 lock - stopping before the build"
+  # --repo-manifest makes verify-lock.py CHECK that witness rather than just assert it
+  # in the provenance record: every lock path present and nothing extra, every SHA pin
+  # matched exactly, and every tag pin resolved to a concrete commit. Without this the
+  # claim in x2-provenance.json ("checked with tools/manifest/verify-lock.py") was
+  # never actually verified by anything.
+  python3 tools/manifest/verify-lock.py --repo-manifest "$resolved_manifest" \
+    || die "the synced tree does not match the committed X1 lock - stopping before the build"
 else
   log "SKIP_SYNC set - reusing the existing workspace (debug only)"
   cd "$WORKSPACE"
