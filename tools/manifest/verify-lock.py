@@ -22,6 +22,24 @@ structural (default, offline, no network)
 compares (a) each project's SHA and (b) the regenerated lock byte-for-byte
 against the committed one. Any difference is reported as drift.
 
+``--repo-manifest`` additionally checks a build-side witness: the XML that
+``repo manifest -r`` wrote on the synced tree. That is the only artifact produced
+by the *build* that says which commit each project is supposed to be at, and until
+this option existed the build recipe merely asserted in its provenance record that
+it had been "checked with tools/manifest/verify-lock.py" -- nothing here ever
+opened the file. What it proves:
+
+    * every ``path`` in the lock appears in the witness, and the witness names no
+      path the lock does not (so the synced tree is the locked set, not a superset);
+    * for every project the lock pins to a 40-hex SHA, the witness carries that
+      exact SHA;
+    * for every project the lock pins to a ``refs/tags/*`` tag, the witness carries
+      a 40-hex SHA -- i.e. repo actually RESOLVED the tag to a concrete commit
+      instead of echoing the moving ref back. The resolved SHA is deliberately not
+      compared to the lock's tag string: an AOSP release tag names a different
+      commit in every repository, so that comparison would fail for 872 of this
+      lock's 1175 active projects while all of them are perfectly in sync.
+
 EXIT CODES
     The exit code is the machine-readable result, and it is the ONLY thing CI
     branches on -- nothing downstream has to parse this tool's prose.
@@ -30,6 +48,9 @@ EXIT CODES
     1  the lock does not match what it should: a structural failure (the offline
        invariants), or live drift, or a regenerated lock that differs from the
        committed bytes. This is a statement about the LOCK, and it is actionable.
+       The same code is returned for a ``--repo-manifest`` disagreement, which is a
+       statement about the synced TREE rather than the lock; the response is still to
+       fix the tree, never to re-cut the lock.
     2  the live re-resolution could not finish: one or more projects came back
        unresolved (network down, a remote 404/rate-limited, a timeout). Nothing
        has been proven either way. This is a statement about the RUN, and the
@@ -55,6 +76,7 @@ Usage::
 
     python tools/manifest/verify-lock.py                 # offline structural check
     python tools/manifest/verify-lock.py --live           # + live re-resolution (advisory)
+    python tools/manifest/verify-lock.py --repo-manifest image/out/repo-manifest-r.xml
     python tools/manifest/verify-lock.py --live --findings-file out.txt
 """
 
@@ -124,6 +146,7 @@ CAT_STRUCTURE = "structure"      # the offline invariants: tampering / corruptio
 CAT_UNRESOLVED = "unresolved"    # the live re-resolution could not finish
 CAT_DRIFT = "drift"              # a resolved revision differs from the lock
 CAT_BYTE_DIFF = "byte-diff"      # the regenerated lock is not byte-identical
+CAT_WITNESS = "witness"          # the synced tree's `repo manifest -r` disagrees
 
 
 def problem(msg: str, category: str = CAT_STRUCTURE) -> None:
@@ -155,6 +178,8 @@ def verdict() -> tuple[int, str]:
         return EXIT_MISMATCH, "lock-invalid"
     if CAT_UNRESOLVED in CATEGORIES:
         return EXIT_INCOMPLETE, "incomplete"
+    if CAT_WITNESS in CATEGORIES:
+        return EXIT_MISMATCH, "witness-mismatch"
     return EXIT_MISMATCH, "drift"
 
 
@@ -170,6 +195,98 @@ def load_lock(path: str) -> list[dict[str, str]]:
     for el in root.findall("project"):
         projects.append(dict(el.attrib))
     return projects
+
+
+def check_repo_manifest(projects: list[dict[str, str]], path: str) -> None:
+    """Check the ``repo manifest -r`` witness produced on the synced tree.
+
+    This is the build-side counterpart to the structural checks above: those say the
+    lock is internally sound, this says the tree that is about to be built is that
+    lock. Three properties, in the order a failure there would be cheapest to
+    diagnose:
+
+    1. coverage both ways -- every locked ``path`` is in the witness and the witness
+       names nothing the lock does not. A project silently dropped from the synced
+       set, or a stray one nobody pinned, both show up here and nowhere else;
+    2. exact agreement on every SHA pin -- a SHA is self-describing, so this is a
+       straight equality check and the strongest statement available;
+    3. every tag pin arrived as a concrete commit -- repo resolving ``refs/tags/*``
+       to a 40-hex SHA is the proof that a moving ref did not survive into the
+       build. The SHA is NOT compared against the lock's tag: an AOSP release tag
+       is a different commit in every repository, so the only correct comparison for
+       a tag pin is "repo resolved it to *some* immutable commit", which is exactly
+       what this is.
+
+    Every finding is a CAT_WITNESS problem, i.e. exit 1: it is a statement about the
+    tree, and the operator's response is to fix the tree, never to re-cut the lock.
+    """
+    if not os.path.exists(path):
+        problem("repo manifest -r witness not found: %s" % path, CAT_WITNESS)
+        return
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        problem("repo manifest -r witness does not parse: %s (%s)" % (path, exc), CAT_WITNESS)
+        return
+
+    seen: dict[str, str] = {}
+    for el in root.findall("project"):
+        p = el.get("path") or el.get("name")
+        if p:
+            seen[p] = el.get("revision") or ""
+
+    locked = {p.get("path") for p in projects}
+
+    absent = sorted(locked - set(seen))
+    if absent:
+        problem(
+            "%d locked project(s) are absent from the synced tree: %s"
+            % (len(absent), ", ".join(absent[:8])),
+            CAT_WITNESS,
+        )
+    extra = sorted(set(seen) - locked)
+    if extra:
+        problem(
+            "%d project(s) synced that the lock does not pin: %s" % (len(extra), ", ".join(extra[:8])),
+            CAT_WITNESS,
+        )
+    if not absent and not extra:
+        ok("witness covers exactly the %d projects the lock pins" % len(locked))
+
+    sha_bad: list[str] = []
+    tag_unresolved: list[str] = []
+    for p in projects:
+        path_attr = p.get("path")
+        revision = p.get("revision") or ""
+        got = seen.get(path_attr)
+        if got is None:
+            continue  # already reported above as absent
+        if SHA_RE.fullmatch(revision):
+            if got != revision:
+                sha_bad.append("%s (lock %s, tree %s)" % (path_attr, revision[:12], got[:12] or "?"))
+        elif not SHA_RE.fullmatch(got):
+            # A refs/tags/* pin that came back as anything other than a commit means
+            # the moving ref reached the build unresolved.
+            tag_unresolved.append("%s (%s -> %s)" % (path_attr, revision, got or "<empty>"))
+
+    if sha_bad:
+        problem(
+            "%d SHA-pinned project(s) are not at their locked revision: %s"
+            % (len(sha_bad), ", ".join(sha_bad[:6])),
+            CAT_WITNESS,
+        )
+    else:
+        ok("every SHA-pinned project is at exactly its locked revision")
+
+    if tag_unresolved:
+        problem(
+            "%d tag-pinned project(s) were not resolved to a commit: %s"
+            % (len(tag_unresolved), ", ".join(tag_unresolved[:6])),
+            CAT_WITNESS,
+        )
+    else:
+        pinned_by_tag = sum(1 for p in projects if (p.get("revision") or "").startswith("refs/tags/"))
+        ok("every tag-pinned project (%d of them) resolved to a concrete commit" % pinned_by_tag)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -192,6 +309,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--timeout", type=int, default=45)
     ap.add_argument("--retries", type=int, default=4)
+    ap.add_argument(
+        "--repo-manifest",
+        metavar="PATH",
+        help=(
+            "also check the `repo manifest -r` witness written on the synced tree: "
+            "path coverage both ways, exact agreement on every SHA pin, and proof "
+            "that every tag pin was resolved to a concrete commit. This is the "
+            "build-side half of the X1 witness; the build recipe passes it."
+        ),
+    )
     ap.add_argument(
         "--findings-file",
         metavar="PATH",
@@ -320,6 +447,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             ok("every project revision agrees between lock and coverage")
+
+    if args.repo_manifest:
+        print("== build-side witness (repo manifest -r) ==")
+        check_repo_manifest(projects, args.repo_manifest)
 
     if args.live:
         print("== live re-resolution (fresh cache, no repo sync) ==")

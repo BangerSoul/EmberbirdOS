@@ -328,8 +328,16 @@ case "$cmd" in
       ls -l "$REPO_ROOT/image/out"
       echo
       echo "X2 record: $REPO_ROOT/image/out/x2-provenance.json"
-      echo "Commit it as docs/evidence/M2/x2-artifact-provenance.json once you have"
-      echo "re-hashed the image locally and filled in the M2 appendix row."
+      # Verify the pulled bytes against the record here, while the operator is
+      # looking at this output. It used to be a printed instruction to re-hash by
+      # hand, which is precisely the step that silently did not happen.
+      if python3 "$REPO_ROOT/tools/manifest/verify-x2-provenance.py"; then
+        echo
+        echo "verified against the record - commit it as"
+        echo "docs/evidence/M2/x2-artifact-provenance.json and fill in the M2 appendix row."
+      else
+        die "the pulled artifacts do NOT match x2-provenance.json - do not cite this record as X2 evidence (see above)"
+      fi
     else
       die "remote pull produced no $src - has the build finished? (bash tools/crave/run-remote-build.sh status)"
     fi

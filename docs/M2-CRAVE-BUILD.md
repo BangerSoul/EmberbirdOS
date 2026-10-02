@@ -27,7 +27,7 @@
 |---|---|---|
 | `repo init` + pin manifests to the X1 revision | Crave machine | pinned checkout |
 | `repo sync -c` (~300 GB, the expensive part) | Crave machine | synced tree |
-| `repo manifest -r`, checked against the committed X1 lock | Crave machine | [`image/out/repo-manifest-r.xml`](../image/out) (git-ignored) |
+| `repo manifest -r`, checked against the committed X1 lock via `verify-lock.py --repo-manifest` | Crave machine | [`image/out/repo-manifest-r.xml`](../image/out) (git-ignored) |
 | `lunch` + `make iso_img` | Crave machine | the guest image |
 | SHA-256 + size + revision + toolchain → X2 record | Crave machine | `image/out/x2-provenance.json` |
 | `crave pull image/out/` | your machine | the image + the X2 record |
@@ -178,15 +178,28 @@ On pull-back:
 
 1. Check `image/out/x2-provenance.json` exists and lists at least one artifact with a
    `sha256` and `bytes` — that record *is* X2.
-2. Re-hash the downloaded image locally and confirm it matches:
+2. **Verify the pulled artifacts against that record**, which is now a command rather
+   than a promise:
+   ```bash
+   python3 tools/manifest/verify-x2-provenance.py
+   ```
+   It re-hashes every recorded artifact, checks the byte sizes, refuses any `.iso`/
+   `.img` in `image/out/` that the record does *not* describe (a stale record beside a
+   newer image), confirms `manifest_revision` equals the committed X1 pin, and confirms
+   the record's own provenance anchor names the committed lock. Exit `0` verified,
+   `1` rejected, `2` nothing pulled yet — and `2` is deliberately **not** a pass, so a
+   green suite can never be read as "the image was verified" when no image exists.
+   `tools/checks/run-offline-checks.sh` runs it as a check, so it is part of every run.
+3. `Get-FileHash` is still worth doing by hand once, as an independent second opinion
+   on a different machine:
    ```powershell
    Get-FileHash .\bliss_arcadia-x86.iso -Algorithm SHA256
    ```
-3. Commit the record as `docs/evidence/M2/x2-artifact-provenance.json` and fill in the
+4. Commit the record as `docs/evidence/M2/x2-artifact-provenance.json` and fill in the
    X2 row of the [execution appendix](M2-GUEST-BOOT-PROOF.md#8-execution-appendix-2026-09-24)
    with the observed values. Until that happens, **X2 stays OPEN** — the artifact is not
    the evidence; the recorded hash and provenance is.
-4. Then execute X3–X5 on the Windows host:
+5. Then execute X3–X5 on the Windows host:
    ```powershell
    .\tools\qemu\provision-host.ps1 -Check
    .\tools\qemu\launch-emberbird.ps1 -Image <path> -DryRun   # X3: resolved argv
@@ -241,6 +254,96 @@ a node**, not "denied compute". Machine-level analysis: `~/.crave/CRAVE-COMPUTE-
 **5. Nothing was built, so nothing is claimed.** No artifact, no hash, no boot. X2 remains
 OPEN; when a job does run, `pull` brings back `x2-provenance.json` plus the image, the local
 re-hash is compared against the record, and only then is the M2 appendix row filled in.
+
+## Closed 2026-10-03: the audit now asks `repo` how to resolve, and the X2 claim is a checked claim
+
+Three defects closed offline; **no job was submitted**, so this section changes no
+record above and X2 stays OPEN.
+
+**1. The audit was resolving tags in the wrong repository.** 872 of the lock's 1175
+active projects pin `refs/tags/android-12.1.0_r22`, and an AOSP release tag is a
+*different commit in every repository*. The audit resolved each distinct tag **once**,
+in whichever project came first in lock order, and compared every other project sharing
+that tag against that one SHA — so a tree that was entirely correct reported ~872
+phantom drifts, and the audit could never pass its own post-re-sync re-audit. Every
+project's pin is now resolved in **its own** checkout, with an explicit guard for a
+lock entry that carries no `revision` at all.
+
+**2. Now it asks `repo` instead of re-deriving the answer.** A tag pin can only be
+settled by the resolution `repo` itself performed, so the recipe generates
+`repo manifest -r` **before** the audit and hands it in. When a project appears in that
+witness, the audit compares on-disk `HEAD` against repo's resolved commit; a `revision`
+repo left as a moving ref is ignored rather than used as a yardstick. With no witness the
+per-project resolution is the fallback, so the pre-audit generation is non-fatal and can
+only make the audit more accurate, never unavailable. The `OK` line says which yardstick
+produced it and how much of it came from where — `(6/6 resolved via repo manifest -r,
+2 SHA pins, 4 resolved in-project)` — because a partial witness is *normal* on a
+depth-1 pre-seeded tree, and a bare "(resolved via repo manifest -r)" would read as
+"repo settled all of them" when it may have settled two.
+
+**2b. The witness is re-resolved after the repair, not just before the first audit.**
+The post-re-sync re-audit is the last gate before `lunch`/`make`, and it was still being
+handed the witness generated *before* the repair — a yardstick describing the tree that
+had just failed. Two ways that goes wrong, both on a job that already paid for the full
+sync: a **false drift**, where the freshly-repaired tree disagrees with a stale value and
+the build dies on the tree it just fixed; and a **missed drift**, where a pin that was
+unresolvable the first time (a depth-1 tree simply does not hold the locked objects) fell
+back to the weaker local lookup — even though the re-sync is exactly what brought those
+objects in. `resolve_witness` now runs three times: before the first audit, after the
+repair and before the re-audit, and again for the mandatory canonical check. On an
+*optional* failure it **deletes** the witness rather than keeping it, because a witness
+that could not be refreshed is worse than no witness — it costs precision to drop (every
+project falls back to its own checkout, which names the same commit) and buys certainty
+that no comparison uses a value from the wrong moment.
+
+**3. The recipe now refuses, or names loudly, a workspace it cannot trust — before the
+multi-hour sync rather than after it.** Job 302748 was a LOS 20 pre-seeded node: ~1000
+of the 1175 lock paths already existed, at the *base project's* revisions, and the only
+thing that noticed was a lunch preflight after the full sync. Two new preflight guards:
+
+- **`inspect_seed`** runs before any sync and dies on a `.repo` that cannot be reused
+  — no `.repo/manifests` git worktree, or a `.repo/manifest.xml` that is missing or does
+  not parse. `repo init` over such a state builds a hybrid (our manifest URL driving
+  someone else's project list) that nothing downstream could interpret. A **foreign
+  base** — a `.repo` tracking a different manifest — is *reported*, not refused, because
+  re-pointing a pre-seeded node is the supported path and is what 302748 relied on. It
+  also counts how many lock paths already have a checkout (~1183 stat calls, seconds),
+  so "this node is holding someone else's content" is a preflight line rather than a
+  post-mortem. Set `REQUIRE_CLEAN_SEED=1` to refuse a foreign base instead.
+- **`manifests_clean`** closes a *silent* provenance hole. `git checkout --detach` carries
+  local modifications across when they don't conflict, so an already-dirty
+  `.repo/manifests` reaches the pinned revision with the wrong content — and the
+  recipe's existing guard is a `rev-parse HEAD` comparison, which **passes** in exactly
+  that case, while the provenance record goes on to print
+  `manifests checkout: 98a0a79…`. The worktree is now checked, not just HEAD. The
+  recipe's own `emberbird-pinned.xml` is the one untracked file allowed.
+
+**4. The provenance claim is now backed by a check.** `x2-provenance.json` records
+`lock_confirmed_by: repo manifest -r, checked with tools/manifest/verify-lock.py`, and
+until now *nothing checked it*: `verify-lock.py` only compared the committed lock against
+the coverage and pin files, and the witness it was credited with was never read. It now
+takes `--repo-manifest PATH` and actually verifies that witness — every lock path present
+and nothing extra, every SHA pin matched exactly, and every tag pin resolved to a concrete
+commit. It deliberately does **not** compare a resolved tag SHA against the lock's tag
+string: the two come from different projects and are not comparable. The canonical step
+regenerates the witness after any repair, so the gate describes the tree about to be built.
+
+Offline coverage: 49 checks in `tools/manifest/test-verify-lock.py` (9 new ones for the
+witness, including all four failure modes), and 14 scenarios in
+`tools/checks/test-revision-audit.sh`. Notable ones: scenario 10 pins the *order* of the
+refresh relative to the re-audit in the recipe source (that control flow needs `repo` to
+run, and a future edit that moved the refresh back after the re-audit would still pass
+`bash -n`); scenarios 12–13 drive `inspect_seed` and `manifests_clean` against synthetic
+`.repo` trees, including the case that matters most — a *modified tracked file at the
+correct HEAD*, which the recipe's previous `rev-parse HEAD` guard demonstrably would not
+have caught. Every new scenario was confirmed to **fail** against the pre-fix recipe
+(`EMBERBIRD_RECIPE=<old> bash tools/checks/test-revision-audit.sh`), so they are not
+checks that merely pass on the thing they were written for. The suite runs green on a
+real 1183-project lock with a synthetic witness, and **auto-detects** a sandbox that
+refuses the revision-recording subcommand, falling back to the plumbing-backed
+`tools/checks/git-shim.sh` — see `tools/checks/lib-fixtures.sh`. On an ordinary machine
+the probe succeeds and nothing is installed, so a normal run has no wrapper on `PATH`
+at all.
 
 ## Executed 2026-10-01: job 302857 ran and FAILED (the audit worked; a dirty worktree broke the repair)
 
@@ -317,9 +420,10 @@ canonical provenance step" claim did not hold on this node:
   fetched. The completeness check tested **directory existence only**, and `repo manifest
   -r` + `LOCK VERIFICATION PASSED` verified manifest-level agreement, not content. The
   recipe's log even showed the tell: `Syncing: 0% (0/137)` for the delta set.
-- `verify-lock.py` is **file-level** (lock ↔ coverage ↔ pin agreement); it never inspects
+- `verify-lock.py` was **file-level** (lock ↔ coverage ↔ pin agreement); it never inspected
   the node's disk. Net: roughly a thousand shared projects were on disk at the wrong
-  revisions, and only the new lunch preflight noticed the tree was not ours.
+  revisions, and only the new lunch preflight noticed the tree was not ours. (It now also
+  takes `--repo-manifest` and checks the build-side witness; see the 2026-10-03 entry.)
 
 A third job (**302852**) was briefly submitted before the audit fix was committed. It
 pinned `0fc8173` — the already-failed revision — because the fix existed only in the
@@ -407,7 +511,13 @@ completes and the completeness check passes regardless.
   inline edit — record it as a finding and stop (M2 §4.3).
 - **`repo sync` is the canonical provenance step**, and it now runs in both places: here
   on Crave, and in `guest-build.yml` on a big-disk runner. Both compare the synced tree
-  against `image/manifest/arcadia-x86.pinned.xml` with `tools/manifest/verify-lock.py`.
+  against `image/manifest/arcadia-x86.pinned.xml` with `tools/manifest/verify-lock.py`,
+  including `--repo-manifest` on the `repo manifest -r` witness.
+- **The recipe's live path is still unrun.** `repo` and an AOSP tree are unavailable
+  here, so `repo manifest -r` itself, the real `repo sync`, and the repair loop are
+  exercised only through the functions extracted into `tools/checks/lib-audit.sh` and
+  a stubbed resolved manifest. What is proven offline is the audit's decision logic, not
+  that a real `repo` produces the XML the recipe expects of it.
 
 ## Related
 

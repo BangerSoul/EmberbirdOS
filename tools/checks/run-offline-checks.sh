@@ -29,6 +29,11 @@
 #     its artifact discovery, and the completeness constants it shares with the lock
 #   * tools/checks/test-revision-audit.sh - the recipe's on-disk revision audit
 #     (HEAD vs the lock) on synthetic git repos: clean, drifted, missing, moved tag
+#   * tools/manifest/test-verify-x2-provenance.py - the post-pull X2 evidence
+#     check's own contract: a stale, truncated, unrecorded or wrong-build record
+#     must FAIL, and "nothing pulled yet" must be distinguishable from a pass
+#   * tools/manifest/verify-x2-provenance.py - image/out/x2-provenance.json against
+#     the artifacts actually on disk (a SKIP until something has been pulled)
 #   * tools/checks/check-powershell-static.py - ASCII purity, delimiter pairing, and
 #     the two shipped scripts' deliberate performance properties
 #   * shellcheck over the shell scripts, when it is installed (informational only)
@@ -205,6 +210,30 @@ sys.exit(1 if bad else 0)
 PY
 }
 
+check_x2_provenance() {
+    # The post-pull half of the X2 chain: re-hash what came back from Crave and
+    # compare it to image/out/x2-provenance.json. Until this existed the "verify the
+    # sha256 above" step in the runbook was a manual eyeball of a number printed on
+    # a node that no longer exists.
+    #
+    # Exit 2 means "no record has been pulled yet", which is the repo's actual
+    # current state -- M2 X2 is OPEN. That is neither a pass nor a failure, and the
+    # distinction matters: a suite that counted it as PASS would let "the pulled
+    # image verified" be read out of a run where nothing was ever pulled. So it is
+    # reported as a skip and the wording says it is not a verification.
+    local rc=0
+    python3 tools/manifest/verify-x2-provenance.py || rc=$?
+    case "$rc" in
+        0) printf '  [ok]   the pulled X2 record matches the artifacts on disk\n' ;;
+        2) printf '  [skip] no X2 record pulled yet - M2 X2 is OPEN, and this is NOT a verification\n' ;;
+        *)
+            printf '  [FAIL] the pulled X2 record does not match the artifacts on disk\n' >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 check_shellcheck() {
     # Informational on purpose. shellcheck is not installed project-wide and is not
     # pinned, so it must not be able to red a run on findings that predate it.
@@ -259,6 +288,7 @@ run "X1 lock: generator unit tests"              python3 tools/checks/test-manif
 run "build recipe: offline tests"                python3 tools/checks/test-build-recipe.py
 run "build recipe: revision audit behaviour"     bash tools/checks/test-revision-audit.sh
 run "PowerShell: static checks"                  python3 tools/checks/check-powershell-static.py
+run "X2 evidence: pulled record vs artifacts"     check_x2_provenance
 run "shellcheck (informational)"                 check_shellcheck
 
 hash_artifacts > "$AFTER"
@@ -277,6 +307,9 @@ cat <<'NOTES'
                                           (windows-latest is the only place it runs)
     * repo sync + the AOSP build       -> guest-build.yml / Crave (big-disk node)
     * QEMU boot + the X3-X5 evidence   -> a WHPX-provisioned Windows host
+    * verifying a REAL pulled image    -> only happens once a job has succeeded and
+                                          `crave pull image/out/` has been run; until
+                                          then the X2 record check is a no-op SKIP
 NOTES
 
 if [ "$FAILED" -gt 0 ]; then

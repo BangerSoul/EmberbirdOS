@@ -21,6 +21,9 @@ WHAT IS PINNED
       be reported as a stale lock;
     * an unresolved ref is never counted as drift in the output;
     * the findings report is written, self-describing, and never silently truncated;
+    * the ``--repo-manifest`` build-side witness is load-bearing: a tree that
+      disagrees with the lock fails, a tag pin that repo resolved to a per-repo
+      commit passes, and omitting the option changes nothing;
     * the CI step maps 0/1/2 to pass/drift/incomplete, maps anything else to
       ``error``, and refuses to publish a verdict when no report was produced.
 
@@ -252,6 +255,65 @@ def _write_fixtures(tmp: str) -> dict:
         json.dump({"manifest": {"revision": PIN_SHA, "branch": "test"}}, fh)
 
     return {"lock": lock, "coverage": coverage, "pin": pin, "findings": findings}
+
+
+def _write_manifest(path: str, projects) -> None:
+    """Write a ``repo manifest -r``-shaped manifest: name + path + resolved revision."""
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<manifest>"]
+    for entry in projects:
+        p, rev = entry[0], entry[1]
+        lines.append(
+            '  <project name="n_%s" path="%s" revision="%s" />'
+            % (p.replace("/", "_"), p, rev)
+        )
+    lines.append("</manifest>")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _write_witness_fixtures(tmp: str, projects) -> dict:
+    """A valid lock/coverage/pin triple that also carries tag pins.
+
+    The lock here mixes SHA pins and ``refs/tags/*`` pins on purpose: the witness
+    check is only interesting if the lock exercises both kinds, because they are
+    compared by different (and equally strict) rules.
+    """
+    import json
+
+    lock = os.path.join(tmp, "lock.xml")
+    coverage = os.path.join(tmp, "coverage.json")
+    pin = os.path.join(tmp, "pin.json")
+
+    _write_manifest(lock, [(p, r) for p, r, _ in projects])
+    # _write_manifest emits no groups and no header comment, and the structural
+    # checks need both: the notdefault group for the active-project invariant, and
+    # the header naming the pinned manifest revision. So the lock is re-emitted here.
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<!-- EmberbirdOS test lock. Generated from BlissRoms-x86/manifest @ %s -->" % PIN_SHA,
+        "<manifest>",
+    ]
+    for p, r, groups in projects:
+        attrs = 'name="n_%s" path="%s" revision="%s"' % (p.replace("/", "_"), p, r)
+        if groups:
+            attrs += ' groups="%s"' % groups
+        lines.append("  <project %s />" % attrs)
+    lines.append("</manifest>")
+    with open(lock, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    with open(coverage, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(
+            {
+                "totals": {"projects": len(projects), "unresolved": 0},
+                "unresolved": [],
+                "projects": [{"path": p, "locked_revision": r} for p, r, _ in projects],
+            },
+            fh,
+        )
+    with open(pin, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump({"manifest": {"revision": PIN_SHA, "branch": "test"}}, fh)
+    return {"lock": lock, "coverage": coverage, "pin": pin}
 
 
 def test_exit_codes() -> None:
@@ -517,11 +579,129 @@ def test_workflow_classification() -> None:
         check("...and says the report was missing", "findings report was not produced" in body)
 
 
+def test_repo_manifest_witness() -> None:
+    """The build-side witness: does ``--repo-manifest`` actually catch a bad tree?
+
+    Until this option existed the build recipe wrote "checked with
+    tools/manifest/verify-lock.py" into its provenance record while verify-lock.py
+    never opened the ``repo manifest -r`` file the recipe produced next to it. These
+    cases pin that the option is load-bearing: a witness that disagrees with the lock
+    must fail the build, and -- just as importantly -- a witness whose *tag* pins
+    resolve to per-repo commits must PASS, because an AOSP release tag names a
+    different commit in every repository. Comparing a resolved tag SHA against the
+    lock's tag string is the trap that made an earlier revision audit report 872 of
+    1175 correct projects as drifted; it must never be reintroduced here.
+    """
+    print("== build-side witness (--repo-manifest) ==")
+
+    tag_a = "refs/tags/android-12.1.0_r22"
+    # Per-repo resolution: the SAME tag, two DIFFERENT commits, exactly as
+    # `repo manifest -r` reports it.
+    resolved_a, resolved_b = "b" * 40, "c" * 40
+
+    projects = [
+        ("x", LOCKED_SHA, None),
+        ("tagged_a", tag_a, None),
+        ("tagged_b", tag_a, None),
+    ]
+    for i in range(ACTIVE_TARGET - len(projects)):
+        projects.append(("filler/%d" % i, LOCKED_SHA, None))
+    for i in range(NOTDEFAULT_COUNT):
+        projects.append(("notdefault/%d" % i, LOCKED_SHA, "notdefault"))
+
+    def run(witness_projects=None, *, omit_witness=False, expect_missing=False):
+        with tempfile.TemporaryDirectory(prefix="emberbird-witness-") as tmp:
+            paths = _write_witness_fixtures(tmp, projects)
+            witness = None
+            if witness_projects is not None or expect_missing:
+                witness = os.path.join(tmp, "repo-manifest-r.xml")
+                if witness_projects is not None:
+                    _write_manifest(witness, witness_projects)
+            argv = [
+                sys.executable,
+                VERIFY,
+                "--lock",
+                paths["lock"],
+                "--coverage",
+                paths["coverage"],
+                "--pin-json",
+                paths["pin"],
+            ]
+            if witness is not None:
+                argv += ["--repo-manifest", witness]
+            return subprocess.run(argv, capture_output=True, text=True, cwd=REPO, timeout=120)
+
+    # The witness repo writes lists EVERY project in the manifest, not just the active
+    # ones, so the fixture witness must too - otherwise the coverage check is really
+    # testing a missing notdefault project rather than anything about tags.
+    tag_resolution = {"tagged_a": resolved_a, "tagged_b": resolved_b}
+    good = [
+        (p, tag_resolution.get(p, r) if r.startswith("refs/tags/") else r)
+        for p, r, _ in projects
+    ]
+
+    proc = run(good)
+    check(
+        "a witness whose tags resolve to per-repo commits PASSES",
+        proc.returncode == 0,
+        "exit %d: %s" % (proc.returncode, proc.stderr[-400:]),
+    )
+    check(
+        "...and says so, rather than silently accepting any 40-hex",
+        "resolved to a concrete commit" in proc.stdout,
+        proc.stdout[-300:],
+    )
+
+    proc = run(expect_missing=True)
+    check("a witness that does not exist FAILS", proc.returncode == 1, "got %d" % proc.returncode)
+
+    drifted = [("x", "0" * 40)] + good[1:]
+    proc = run(drifted)
+    check(
+        "a SHA pin that moved is caught",
+        proc.returncode == 1 and "are not at their locked revision" in proc.stderr,
+        proc.stderr[-300:],
+    )
+
+    proc = run(good[:-1])
+    check(
+        "a project dropped from the tree is caught",
+        proc.returncode == 1 and "absent from the synced tree" in proc.stderr,
+        proc.stderr[-300:],
+    )
+
+    proc = run(good + [("rogue/project", "1" * 40)])
+    check(
+        "a project nobody pinned is caught",
+        proc.returncode == 1 and "the lock does not pin" in proc.stderr,
+        proc.stderr[-300:],
+    )
+
+    unresolved = [(p, tag_a if p == "tagged_a" else r) for p, r in good]
+    proc = run(unresolved)
+    check(
+        "a moving ref that reached the build unresolved is caught",
+        proc.returncode == 1 and "were not resolved to a commit" in proc.stderr,
+        proc.stderr[-300:],
+    )
+    check(
+        "the witness verdict is distinguishable from upstream drift",
+        "witness-mismatch" in proc.stderr,
+        proc.stderr[-300:],
+    )
+
+    # No --repo-manifest at all: the offline CI path must be completely unaffected.
+    proc = run()
+    check("omitting --repo-manifest leaves the offline check untouched", proc.returncode == 0)
+
+
 def main() -> int:
     print("EmberbirdOS - verify-lock.py exit-code contract\n")
     test_verdict_precedence()
     print()
     test_exit_codes()
+    print()
+    test_repo_manifest_witness()
     print()
     test_findings_report()
     print()
