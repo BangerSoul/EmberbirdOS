@@ -323,6 +323,83 @@ else
   echo "  [FAIL] the audit accepted a tree the witness disagrees with: $(head -1 "$R9c")"; fail=1
 fi
 
+echo "-- 10. the recipe re-resolves the witness BEFORE the post-re-sync re-audit"
+# The control flow in the repair branch is not exercisable offline - it needs `repo`
+# and a real `repo sync` - so this pins the ORDER in the recipe source instead, which
+# is the entire content of the fix. Line numbers are the test: a future edit that
+# moves the refresh back after the re-audit (where it already also runs, for the
+# canonical check) would still look correct to `bash -n` and to every other scenario.
+# Each lookup is `|| true`: under `set -e` a grep that matches nothing fails the
+# assignment and would abort the suite outright, which is exactly how one red check
+# hides the state of the ones after it. An absent call site is this check's SUBJECT,
+# so it must be reported below, not kill the run before it gets there.
+FIRST_AUDIT=$(grep -n 'if revision_audit "$audit_out" "$resolved_manifest"' "$RECIPE" | cut -d: -f1 || true)
+REFRESH=$(grep -n 'resolve_witness "$resolved_manifest" || true' "$RECIPE" | tail -1 | cut -d: -f1 || true)
+RE_AUDIT=$(grep -n 'if ! revision_audit "$audit_out" "$resolved_manifest"' "$RECIPE" | cut -d: -f1 || true)
+REQUIRED=$(grep -n 'resolve_witness "$resolved_manifest" required' "$RECIPE" | cut -d: -f1 || true)
+if [ -n "$FIRST_AUDIT" ] && [ -n "$REFRESH" ] && [ -n "$RE_AUDIT" ] && [ -n "$REQUIRED" ]; then
+  echo "  [info] first audit L$FIRST_AUDIT, refresh L$REFRESH, re-audit L$RE_AUDIT, canonical L$REQUIRED"
+  if [ "$FIRST_AUDIT" -lt "$REFRESH" ] && [ "$REFRESH" -lt "$RE_AUDIT" ] && [ "$RE_AUDIT" -lt "$REQUIRED" ]; then
+    echo "  [PASS] the refresh sits between the failing audit and the re-audit"
+  else
+    echo "  [FAIL] expected first audit < refresh < re-audit < canonical"; fail=1
+  fi
+else
+  echo "  [FAIL] could not locate the audit/refresh call sites in the recipe"; fail=1
+fi
+
+echo "-- 11. resolve_witness: a stale witness is replaced, and a failure leaves none"
+if [ "${EMBERBIRD_HAS_RESOLVE_WITNESS:-0}" != "1" ]; then
+  echo "  [FAIL] the recipe no longer defines resolve_witness()"; fail=1
+else
+  STUBBIN="$T/repo-stub-bin"
+  mkdir -p "$STUBBIN"
+  W="$T/witness.xml"
+  printf 'STALE\n' > "$W"
+
+  # repo succeeds and rewrites the file -> the new contents must be what survives.
+  cat > "$STUBBIN/repo" <<'STUB'
+#!/usr/bin/env bash
+# stub repo manifest -r: writes $STUB_REPO_BODY to the -o path, exits $STUB_REPO_RC.
+# An EMPTY STUB_REPO_BODY writes NOTHING at all (repo can exit 0 having produced no
+# file), which is the case resolve_witness must not accept as a resolution.
+out=""
+while [ $# -gt 0 ]; do
+  [ "$1" = "-o" ] && { out="$2"; shift; }
+  shift
+done
+if [ -z "${STUB_REPO_BODY+set}" ]; then body="RESOLVED"; else body="$STUB_REPO_BODY"; fi
+[ -n "$out" ] && [ -n "$body" ] && printf '%s\n' "$body" > "$out"
+exit "${STUB_REPO_RC:-0}"
+STUB
+  chmod +x "$STUBBIN/repo"
+  PATH="$STUBBIN:$PATH"
+
+  STUB_REPO_BODY=FRESH STUB_REPO_RC=0 resolve_witness "$W" >/dev/null
+  if [ "$(cat "$W")" = "FRESH" ]; then
+    echo "  [PASS] a successful re-resolve replaces the old witness"
+  else
+    echo "  [FAIL] witness still says '$(cat "$W")' after a successful re-resolve"; fail=1
+  fi
+
+  # repo fails -> the file must be GONE, not left stale for the audit to trust.
+  printf 'STALE\n' > "$W"
+  set +e
+  STUB_REPO_BODY=NEVER STUB_REPO_RC=1 resolve_witness "$W" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] && [ ! -e "$W" ]; then
+    echo "  [PASS] a failed re-resolve returns nonzero and leaves NO witness behind"
+  else
+    echo "  [FAIL] rc=$rc, witness exists=$([ -e "$W" ] && echo yes || echo no)"; fail=1
+  fi
+
+  # repo exits 0 but writes nothing -> also treated as a failure, not a success.
+  STUB_REPO_BODY="" STUB_REPO_RC=0 resolve_witness "$W" >/dev/null 2>&1 \
+    && echo "  [FAIL] an empty witness file was accepted as a resolution" && fail=1 \
+    || echo "  [PASS] repo exiting 0 without writing anything is not a resolution"
+fi
+
 echo
 if [ "$fail" = 0 ]; then
   echo "revision audit offline test: PASS"

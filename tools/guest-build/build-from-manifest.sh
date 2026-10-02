@@ -338,21 +338,46 @@ PY
   # an AOSP release tag is a DIFFERENT commit in every repository - so a tag pin can
   # only be settled by repo's own revision resolution, not by re-deriving one in a
   # shell heredoc. `repo manifest -r` IS that resolution, and it is already the
-  # artifact the provenance record names as the build-side witness. Generate it once
-  # HERE, before the audit, so the audit compares on-disk HEAD against repo's answer
-  # instead of guessing (see revision_audit's $2).
+  # artifact the provenance record names as the build-side witness. Generate it here
+  # so the audit compares on-disk HEAD against repo's answer instead of guessing
+  # (see revision_audit's $2).
   #
-  # A failure here is not fatal: the audit falls back to resolving each pin in the
-  # project's own git dir, and the mandatory witness below still runs after any
-  # repair. So this can only ever make the audit more accurate, never unavailable.
+  # This is called a THIRD time after any repair - see below, and resolve_witness for
+  # why a witness that has been around since before a `repo sync` is worse than none.
+  resolve_witness() {
+    # Regenerate the `repo manifest -r` witness into $1.
+    #
+    # $2 = "required" for the canonical gate, where the witness IS the provenance
+    # claim and a failure is fatal. Anything else is an audit step, where a failure
+    # must never stop the build.
+    #
+    # ON AN OPTIONAL FAILURE THE WITNESS IS REMOVED, not kept. A witness we could
+    # not refresh describes a tree that no longer exists, and both ways that goes
+    # wrong are worse than simply having none: the audit would judge the current
+    # tree against a stale yardstick, which can either invent drift on a perfectly
+    # good tree or wave through one that genuinely moved. Dropping it costs
+    # precision - every project then falls back to resolving its pin in its own
+    # checkout, which is the same commit repo would name - and buys certainty that
+    # no comparison uses a value from the wrong moment.
+    local out="$1" mode="${2:-optional}"
+    rm -f "$out"
+    if repo manifest -r -o "$out" && [ -s "$out" ]; then
+      printf '  resolved manifest: %s\n' "$out"
+      return 0
+    fi
+    # repo can exit 0 having written a partial file, so a failed run never leaves
+    # one behind for the audit to trust.
+    rm -f "$out"
+    if [ "$mode" = "required" ]; then
+      die "repo manifest -r failed - the synced tree is missing or cannot resolve a project the frozen lock references (see the sync-completeness step above), so the canonical X1 witness cannot be produced."
+    fi
+    echo "note: repo manifest -r could not resolve every project; the audit will resolve each pin in its own checkout instead (the canonical witness check below is mandatory and runs regardless)"
+    return 1
+  }
+
   log "resolving the active manifest per project (repo manifest -r)"
   resolved_manifest="$OUT_DIR/repo-manifest-r.xml"
-  rm -f "$resolved_manifest"
-  if repo manifest -r -o "$resolved_manifest"; then
-    printf '  resolved manifest: %s\n' "$resolved_manifest"
-  else
-    echo "note: repo manifest -r could not resolve every project; the audit will resolve each pin in its own checkout instead (the mandatory witness below still runs)"
-  fi
+  resolve_witness "$resolved_manifest" || true
 
   # Revision audit - presence is NOT content.
   #
@@ -441,6 +466,13 @@ if resolved_arg and os.path.exists(resolved_arg):
 
 missing = []
 mismatch = []
+# How much of this verdict rests on repo's own resolution, and how much on the
+# weaker per-project fallback. Reported on the OK line because a partial witness is
+# normal on a depth-1 pre-seeded tree, and "(resolved via repo manifest -r)" on its
+# own would read as "repo settled all of them" when it may have settled two.
+via_witness = 0
+sha_pins = 0
+in_project = 0
 for path, rev in rows:
     if not os.path.exists(os.path.join(ws, path, ".git")):
         missing.append(path)
@@ -455,8 +487,11 @@ for path, rev in rows:
     if path in resolved:
         # repo resolved this pin; its answer is the lock's answer, by construction.
         want = resolved[path]
+        via_witness += 1
     elif SHA_RE.fullmatch(rev):
+        # A SHA names its own commit, so it is never in doubt and needs no witness.
         want = rev
+        sha_pins += 1
     else:
         # No resolved manifest for this project: resolve the pin in the project's own
         # git dir, which is what repo would do for it too.
@@ -466,16 +501,28 @@ for path, rev in rows:
                 (path, "lock pins %s but this project's own checkout does not resolve it" % rev)
             )
             continue
+        in_project += 1
     if head != want:
         mismatch.append((path, "on-disk %s, locked %s (%s)" % (head[:12], want[:12], rev[:28])))
 
 lines = []
 if not missing and not mismatch:
-    # Say which yardstick produced this verdict: "OK" means the same thing in both
-    # modes, and a reader deciding whether the tree was actually proven has to know.
+    # Say exactly which yardstick produced this verdict, and how much of it came from
+    # where. "OK" has to mean the same thing in every mode, and a reader deciding
+    # whether the tree was actually proven by repo - rather than by a local fallback
+    # on a shallow tree - has to be able to tell the difference from one line.
+    how = []
+    if via_witness:
+        how.append("%d/%d resolved via repo manifest -r" % (via_witness, len(rows)))
+    else:
+        how.append("no repo manifest -r witness")
+    if sha_pins:
+        how.append("%d SHA pins" % sha_pins)
+    if in_project:
+        how.append("%d resolved in-project" % in_project)
     lines.append(
-        "OK all %d active projects on disk at their locked revisions%s"
-        % (len(rows), " (resolved via repo manifest -r)" if resolved else "")
+        "OK all %d active projects on disk at their locked revisions (%s)"
+        % (len(rows), ", ".join(how))
     )
 else:
     if missing:
@@ -564,6 +611,29 @@ PY
       repo sync -c -j"$SYNC_JOBS" --no-manifest-update --no-tags --force-sync "${drifted_paths[@]}" \
         || die "re-sync of the drifted projects failed (see above). The locked revisions must be fetchable from their remotes; if a pinned SHA is unreachable upstream, re-cut the lock (tools/manifest/resolve-manifest-lock.py)."
     fi
+    # Re-resolve BEFORE the re-audit, not just before the canonical check below.
+    #
+    # The witness handed to this audit was generated before the repair, so it
+    # describes the tree that FAILED the first audit. Judging the repaired tree
+    # against it is the stale-yardstick bug in its purest form, and this is the
+    # last gate before lunch/make - so a wrong answer here dies a job that already
+    # paid for the full sync. Two concrete ways it goes wrong:
+    #
+    #   * false drift. The re-sync moved projects onto the locked revisions. If
+    #     anything about the tree's resolution changed in the meantime, the old
+    #     witness disagrees with a tree that is now correct, the re-audit fails,
+    #     and the build dies on the tree it just repaired.
+    #   * a missed drift. If a pin was unresolvable the FIRST time round (a
+    #     depth-1 pre-seeded tree simply does not hold the locked objects), the
+    #     audit skipped it and fell back to a local lookup - the weaker method this
+    #     whole change exists to remove. The re-sync is exactly what brought those
+    #     objects in, so re-resolving now can settle those projects through repo
+    #     where before it could not.
+    #
+    # A failure here is non-fatal and leaves no witness, so the re-audit falls back
+    # to per-project resolution rather than using a stale one.
+    log "re-resolving the manifest after the repair, so the re-audit judges the tree it just produced"
+    resolve_witness "$resolved_manifest" || true
     if ! revision_audit "$audit_out" "$resolved_manifest"; then
       printf '  %s\n' "$(head -1 "$audit_out")"
       die "on-disk revisions STILL disagree with the lock after a forced re-sync (full report: $audit_out) - refusing to build a tree that is not the locked one."
@@ -572,10 +642,10 @@ PY
   fi
 
   log "canonical check: repo manifest -r against the committed X1 lock"
-  # Regenerated here, after any repair, so the witness that gates the build describes
-  # the tree that is about to be built - not the one the audit was first handed.
-  repo manifest -r -o "$resolved_manifest" \
-    || die "repo manifest -r failed - the synced tree is missing or cannot resolve a project the frozen lock references (see the sync-completeness step above), so the canonical X1 witness cannot be produced."
+  # Regenerated here regardless, so the witness that gates the build describes the
+  # tree that is about to be built. The re-audit above already refreshed it, but this
+  # one is mandatory and must not inherit anything from an earlier step.
+  resolve_witness "$resolved_manifest" required
   cd "$REPO_ROOT"
   # --repo-manifest makes verify-lock.py CHECK that witness rather than just assert it
   # in the provenance record: every lock path present and nothing extra, every SHA pin
