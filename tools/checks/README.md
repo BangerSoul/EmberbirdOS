@@ -39,7 +39,7 @@ command.
 | X2 evidence, pulled record | `../manifest/verify-x2-provenance.py` | that `image/out/x2-provenance.json` describes the artifacts actually on disk: every recorded hash and byte count matches, no unrecorded `.iso`/`.img` is sitting beside it, and `manifest_revision` equals the committed X1 pin |
 | X2 evidence, verifier contract | `../manifest/test-verify-x2-provenance.py` | that the check above *fails* on a stale, truncated, unrecorded, traversing or wrong-build record, and that an empty artifact list is a failure rather than a vacuous pass |
 | build recipe | `test-build-recipe.py` | the recipe's two embedded Python heredocs, artifact discovery, and the completeness constants it shares with the lock |
-| revision audit | `test-revision-audit.sh` | `revision_audit()` and `sanitize_worktrees()` extracted *verbatim* from the recipe by `lib-audit.sh`: per-project tag resolution, a tag one repository has and another does not, a stubbed `repo manifest -r` witness, and its absence |
+| revision audit | `test-revision-audit.sh` | `revision_audit()`, `sanitize_worktrees()` and `resolve_witness()` extracted *verbatim* from the recipe by `lib-audit.sh`: per-project tag resolution, a tag one repository has and another does not, a stubbed `repo manifest -r` witness and its absence, and the ORDER in which the witness is re-resolved around the repair |
 | fixture git | `lib-fixtures.sh` + `git-shim.sh` | whether this environment's git can record a revision at all; when it cannot, the shim stands in so the audit still runs against real revisions instead of a field of unborn HEADs |
 | PowerShell, static | `check-powershell-static.py` | ASCII purity, delimiter pairing, no dangling refs to removed symbols, and the launcher's deliberate `-DryRun` fast path |
 | shellcheck | `run-offline-checks.sh` | every shell script, when shellcheck is installed (informational: it is neither pinned nor installed project-wide, so it never reds a run) |
@@ -90,6 +90,23 @@ wrapper on `PATH` at all. And any test using it asserts first that its fixture `
 resolves to a full sha (scenario 0 in `test-revision-audit.sh`), so a broken fixture git
 fails immediately and loudly instead of turning every later scenario red for an unrelated
 reason.
+
+## Proving a check is load-bearing
+
+A source-level check that reads the recipe's own text -- its call order, its constants,
+its embedded heredocs -- passes trivially against the recipe it was written for, and a
+typo in the pattern silently turns it into a check that passes against anything.
+`lib-audit.sh` therefore honours `EMBERBIRD_RECIPE`, which points the whole suite at a
+different recipe revision:
+
+```bash
+git show HEAD~1:tools/guest-build/build-from-manifest.sh > /tmp/old.sh
+EMBERBIRD_RECIPE=/tmp/old.sh bash tools/checks/test-revision-audit.sh   # must FAIL
+```
+
+Anything the previous commit was missing must go red, for the right reason, *without
+aborting the run* -- a check that crashes the suite instead of reporting a failure hides
+the state of every scenario after it, which is the one thing this suite exists to prevent.
 
 ## Rules for adding a check here
 

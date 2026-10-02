@@ -276,8 +276,25 @@ witness, the audit compares on-disk `HEAD` against repo's resolved commit; a `re
 repo left as a moving ref is ignored rather than used as a yardstick. With no witness the
 per-project resolution is the fallback, so the pre-audit generation is non-fatal and can
 only make the audit more accurate, never unavailable. The `OK` line says which yardstick
-produced it (`(resolved via repo manifest -r)`), because "OK" has to mean the same thing
-in both modes and a reader deciding whether the tree was actually proven has to know.
+produced it and how much of it came from where — `(6/6 resolved via repo manifest -r,
+2 SHA pins, 4 resolved in-project)` — because a partial witness is *normal* on a
+depth-1 pre-seeded tree, and a bare "(resolved via repo manifest -r)" would read as
+"repo settled all of them" when it may have settled two.
+
+**2b. The witness is re-resolved after the repair, not just before the first audit.**
+The post-re-sync re-audit is the last gate before `lunch`/`make`, and it was still being
+handed the witness generated *before* the repair — a yardstick describing the tree that
+had just failed. Two ways that goes wrong, both on a job that already paid for the full
+sync: a **false drift**, where the freshly-repaired tree disagrees with a stale value and
+the build dies on the tree it just fixed; and a **missed drift**, where a pin that was
+unresolvable the first time (a depth-1 tree simply does not hold the locked objects) fell
+back to the weaker local lookup — even though the re-sync is exactly what brought those
+objects in. `resolve_witness` now runs three times: before the first audit, after the
+repair and before the re-audit, and again for the mandatory canonical check. On an
+*optional* failure it **deletes** the witness rather than keeping it, because a witness
+that could not be refreshed is worse than no witness — it costs precision to drop (every
+project falls back to its own checkout, which names the same commit) and buys certainty
+that no comparison uses a value from the wrong moment.
 
 **3. The provenance claim is now backed by a check.** `x2-provenance.json` records
 `lock_confirmed_by: repo manifest -r, checked with tools/manifest/verify-lock.py`, and
@@ -290,12 +307,19 @@ string: the two come from different projects and are not comparable. The canonic
 regenerates the witness after any repair, so the gate describes the tree about to be built.
 
 Offline coverage: 49 checks in `tools/manifest/test-verify-lock.py` (9 new ones for the
-witness, including all four failure modes), and 10 scenarios in
-`tools/checks/test-revision-audit.sh`. The suite runs green on a real 1183-project lock
-with a synthetic witness, and **auto-detects** a sandbox that refuses the
-revision-recording subcommand, falling back to the plumbing-backed `tools/checks/git-shim.sh`
-— see `tools/checks/lib-fixtures.sh`. On an ordinary machine the probe succeeds and
-nothing is installed, so a normal run has no wrapper on `PATH` at all.
+witness, including all four failure modes), and 12 scenarios in
+`tools/checks/test-revision-audit.sh` — including scenario 10, which pins the *order* of
+the refresh relative to the re-audit in the recipe source (that control flow needs `repo`
+to run, and a future edit that moved the refresh back after the re-audit would still pass
+`bash -n`), and scenario 11, which drives `resolve_witness` against a stubbed `repo` on
+`PATH`. Both new scenarios were confirmed to **fail** against the pre-fix recipe
+(`EMBERBIRD_RECIPE=<old> bash tools/checks/test-revision-audit.sh`), so they are not
+checks that merely pass on the thing they were written for. The suite runs green on a
+real 1183-project lock with a synthetic witness, and **auto-detects** a sandbox that
+refuses the revision-recording subcommand, falling back to the plumbing-backed
+`tools/checks/git-shim.sh` — see `tools/checks/lib-fixtures.sh`. On an ordinary machine
+the probe succeeds and nothing is installed, so a normal run has no wrapper on `PATH`
+at all.
 
 ## Executed 2026-10-01: job 302857 ran and FAILED (the audit worked; a dirty worktree broke the repair)
 
