@@ -25,6 +25,19 @@ RECIPE="${EMBERBIRD_RECIPE:-$HERE/../guest-build/build-from-manifest.sh}"
 # "die: command not found" - which would look like a broken recipe, not a stub.
 die() { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# These two are the preflight guards: they need only `git` and the filesystem, so the
+# offline suite can exercise them against synthetic .repo directories.
+for _fn in inspect_seed manifests_clean; do
+  _body="$(sed -n "/^[[:space:]]*${_fn}()[[:space:]]*{/,/^[[:space:]]*}[[:space:]]*$/p" "$RECIPE")"
+  if [ -n "$_body" ]; then
+    eval "$_body"
+  else
+    EMBERBIRD_MISSING_FNS="${EMBERBIRD_MISSING_FNS:-} $_fn"
+  fi
+  unset _body
+done
+unset _fn
+
 _witness_fn="$(sed -n '/^[[:space:]]*resolve_witness()[[:space:]]*{/,/^[[:space:]]*}[[:space:]]*$/p' "$RECIPE")"
 # Not fatal when absent: an older recipe revision without the helper still has an
 # auditable revision_audit, and the test reports the helper's absence as a failure of

@@ -296,7 +296,29 @@ that could not be refreshed is worse than no witness — it costs precision to d
 project falls back to its own checkout, which names the same commit) and buys certainty
 that no comparison uses a value from the wrong moment.
 
-**3. The provenance claim is now backed by a check.** `x2-provenance.json` records
+**3. The recipe now refuses, or names loudly, a workspace it cannot trust — before the
+multi-hour sync rather than after it.** Job 302748 was a LOS 20 pre-seeded node: ~1000
+of the 1175 lock paths already existed, at the *base project's* revisions, and the only
+thing that noticed was a lunch preflight after the full sync. Two new preflight guards:
+
+- **`inspect_seed`** runs before any sync and dies on a `.repo` that cannot be reused
+  — no `.repo/manifests` git worktree, or a `.repo/manifest.xml` that is missing or does
+  not parse. `repo init` over such a state builds a hybrid (our manifest URL driving
+  someone else's project list) that nothing downstream could interpret. A **foreign
+  base** — a `.repo` tracking a different manifest — is *reported*, not refused, because
+  re-pointing a pre-seeded node is the supported path and is what 302748 relied on. It
+  also counts how many lock paths already have a checkout (~1183 stat calls, seconds),
+  so "this node is holding someone else's content" is a preflight line rather than a
+  post-mortem. Set `REQUIRE_CLEAN_SEED=1` to refuse a foreign base instead.
+- **`manifests_clean`** closes a *silent* provenance hole. `git checkout --detach` carries
+  local modifications across when they don't conflict, so an already-dirty
+  `.repo/manifests` reaches the pinned revision with the wrong content — and the
+  recipe's existing guard is a `rev-parse HEAD` comparison, which **passes** in exactly
+  that case, while the provenance record goes on to print
+  `manifests checkout: 98a0a79…`. The worktree is now checked, not just HEAD. The
+  recipe's own `emberbird-pinned.xml` is the one untracked file allowed.
+
+**4. The provenance claim is now backed by a check.** `x2-provenance.json` records
 `lock_confirmed_by: repo manifest -r, checked with tools/manifest/verify-lock.py`, and
 until now *nothing checked it*: `verify-lock.py` only compared the committed lock against
 the coverage and pin files, and the witness it was credited with was never read. It now
@@ -307,12 +329,14 @@ string: the two come from different projects and are not comparable. The canonic
 regenerates the witness after any repair, so the gate describes the tree about to be built.
 
 Offline coverage: 49 checks in `tools/manifest/test-verify-lock.py` (9 new ones for the
-witness, including all four failure modes), and 12 scenarios in
-`tools/checks/test-revision-audit.sh` — including scenario 10, which pins the *order* of
-the refresh relative to the re-audit in the recipe source (that control flow needs `repo`
-to run, and a future edit that moved the refresh back after the re-audit would still pass
-`bash -n`), and scenario 11, which drives `resolve_witness` against a stubbed `repo` on
-`PATH`. Both new scenarios were confirmed to **fail** against the pre-fix recipe
+witness, including all four failure modes), and 14 scenarios in
+`tools/checks/test-revision-audit.sh`. Notable ones: scenario 10 pins the *order* of the
+refresh relative to the re-audit in the recipe source (that control flow needs `repo` to
+run, and a future edit that moved the refresh back after the re-audit would still pass
+`bash -n`); scenarios 12–13 drive `inspect_seed` and `manifests_clean` against synthetic
+`.repo` trees, including the case that matters most — a *modified tracked file at the
+correct HEAD*, which the recipe's previous `rev-parse HEAD` guard demonstrably would not
+have caught. Every new scenario was confirmed to **fail** against the pre-fix recipe
 (`EMBERBIRD_RECIPE=<old> bash tools/checks/test-revision-audit.sh`), so they are not
 checks that merely pass on the thing they were written for. The suite runs green on a
 real 1183-project lock with a synthetic witness, and **auto-detects** a sandbox that

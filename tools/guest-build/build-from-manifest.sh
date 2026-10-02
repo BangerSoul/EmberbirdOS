@@ -90,6 +90,140 @@ if [ "$mem_gb" -lt 15 ]; then
   die "only ${mem_gb} GB RAM; the AOSP build expects 16 GB+."
 fi
 
+# ------------------------------------------------------- pre-seeded .repo ----
+inspect_seed() {
+  # inspect_seed <workspace> <expected manifest url> <lock xml>
+  #
+  # A pre-seeded .repo is EXPECTED on Crave and on any warm runner - refusing one
+  # would refuse the only configuration that has ever produced a build. So this never
+  # dies merely because the workspace was seeded. It dies only on states we cannot
+  # reason about, and it REPORTS the foreign-base case up front rather than letting a
+  # multi-hour sync rediscover what a two-second inspection already knows.
+  #
+  # FATAL here means "repo cannot reuse this, and nothing downstream could tell us
+  # what it ended up with":
+  #   * a .repo with no .repo/manifests, or with one that is not a git worktree.
+  #     `repo init` over that yields a hybrid - our manifest URL driving someone
+  #     else's project list - which is not a state any later check can interpret.
+  #   * a .repo/manifest.xml that is missing or does not parse.
+  local ws="$1" want_url="$2" lock="$3"
+  local mdir="$ws/.repo/manifests" mxml="$ws/.repo/manifest.xml"
+
+  if [ ! -e "$ws/.repo" ]; then
+    printf '  seed: none (cold runner)\n'
+    return 0
+  fi
+  if [ ! -d "$mdir" ] || ! git -C "$mdir" rev-parse --git-dir >/dev/null 2>&1; then
+    die "$ws/.repo exists but is not a usable repo checkout (no git worktree at .repo/manifests). repo init over it would produce a hybrid tree no later check could verify - remove that .repo, or point WORKSPACE at a clean root."
+  fi
+  if [ ! -f "$mxml" ]; then
+    die "$mxml is missing from an existing .repo - repo cannot reuse this. Remove the .repo, or point WORKSPACE at a clean root."
+  fi
+  if ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$mxml" 2>/dev/null; then
+    die "$mxml does not parse as XML - repo would sync against a manifest we cannot read. Remove the .repo, or point WORKSPACE at a clean root."
+  fi
+
+  # Whose base is it? Normalise so .git / trailing-slash / case differences are not
+  # reported as a different project. Slash FIRST: ".../manifest.git/" ends in a slash,
+  # so a `\.git$` applied before the slash is stripped never matches.
+  local have_url have_norm want_norm
+  have_url="$(git -C "$mdir" remote get-url origin 2>/dev/null || true)"
+  have_norm="$(printf '%s' "$have_url" | tr 'A-Z' 'a-z' | sed -e 's#/*$##' -e 's#\.git$##')"
+  want_norm="$(printf '%s' "$want_url"   | tr 'A-Z' 'a-z' | sed -e 's#/*$##' -e 's#\.git$##')"
+
+  if [ -n "$have_url" ] && [ "$have_norm" != "$want_norm" ]; then
+    printf '  seed: FOREIGN BASE - .repo/manifests tracks %s\n' "$have_url"
+    printf '  seed: this build expects %s\n' "$want_url"
+    printf '  seed: the sync below re-points .repo at our lock, so this is recoverable,\n'
+    printf '  seed: but the existing checkouts are at the OTHER project revisions and the\n'
+    printf '  seed: revision audit is the authority on what actually landed. Set\n'
+    printf '  seed: REQUIRE_CLEAN_SEED=1 to refuse a foreign base instead of repairing it.\n'
+    if [ -n "${REQUIRE_CLEAN_SEED:-}" ]; then
+      die "$ws/.repo was seeded for a different project ($have_url), not $want_url, and REQUIRE_CLEAN_SEED is set. Remove the .repo or point WORKSPACE at a clean root."
+    fi
+  elif [ -n "$have_url" ]; then
+    printf '  seed: ours (%s)\n' "$have_url"
+  else
+    printf '  seed: .repo present but .repo/manifests has no origin remote\n'
+  fi
+
+  # How much of the tree is already on disk? This is the number job 302748 turned on
+  # hours too late: ~1000 lock paths existed, at LOS 20 revisions, and only the
+  # existence check ran. Counting them now costs ~1183 stat calls and turns "this node
+  # was pre-seeded with someone else's content" into a line in the preflight.
+  if [ -f "$lock" ]; then
+    local counts c_total c_present
+    counts="$(LOCK_XML="$lock" SEED_WS="$ws" python3 -c '
+import os, sys, xml.etree.ElementTree as ET
+try:
+    sys.stdout.reconfigure(newline="\n")
+except (AttributeError, ValueError):
+    pass
+root = ET.parse(os.environ["LOCK_XML"]).getroot()
+ws = os.environ["SEED_WS"]
+total = present = 0
+for p in root.findall("project"):
+    groups = {g.strip() for g in (p.get("groups") or "").split(",") if g.strip()}
+    if "notdefault" in groups:
+        continue
+    path = p.get("path") or p.get("name")
+    if not path:
+        continue
+    total += 1
+    if os.path.exists(os.path.join(ws, path, ".git")):
+        present += 1
+print("%d %d" % (total, present))
+' 2>/dev/null || true)"
+    if [ -n "$counts" ]; then
+      c_total="${counts% *}"; c_present="${counts##* }"
+      printf '  seed: %s of %s active lock paths already have a checkout (sync will be incremental)\n' "$c_present" "$c_total"
+      if [ "${c_total:-0}" -gt 0 ] && [ "${c_present:-0}" -gt 0 ]; then
+        printf '  seed: existing checkouts are NOT trusted - the revision audit re-verifies every one after sync\n'
+      fi
+    fi
+  fi
+  return 0
+}
+
+manifests_clean() {
+  # manifests_clean <dir> [allowed untracked path ...]
+  #
+  # `git checkout --detach <sha>` CARRIES local modifications across when they do not
+  # conflict. So a .repo/manifests that was already dirty reaches the pinned revision
+  # with a modified worktree - and the recipe's own guard is a `rev-parse HEAD`
+  # comparison, which still passes. The manifest actually in use is then NOT the one
+  # X1 pinned, while the provenance record goes on to say
+  #   manifests checkout: <MANIFEST_REVISION>
+  # That is a silent provenance hole, so check the worktree, not just HEAD.
+  #
+  # The recipe deliberately drops emberbird-pinned.xml into this checkout, so that one
+  # untracked file is expected and allowed. Anything else - a modified tracked file, or
+  # any other untracked debris - is not ours and must not survive into a provenance
+  # build.
+  local dir="$1"; shift
+  local allowed="$*" status line
+  status="$(git -C "$dir" status --porcelain 2>/dev/null || true)"
+  local dirty=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    local path="${line:3}"
+    case " $allowed " in
+      *" $path "*) continue ;;
+    esac
+    dirty="$dirty$line"$'\n'
+  done <<< "$status"
+  [ -z "$dirty" ] && return 0
+  printf '%s' "$dirty" >&2
+  die ".repo/manifests has local modifications (above) - the manifest in use is not the pinned revision even though HEAD matches. Run 'git -C .repo/manifests checkout --force <rev>' or remove .repo/manifests; refusing to build from a manifest we cannot vouch for."
+}
+
+# Skipped under SKIP_SYNC: that mode deliberately reuses whatever is already on disk,
+# including a workspace being debugged because its .repo went wrong. Refusing to even
+# LOOK would defeat the only mode that exists for inspecting that state.
+if [ -z "${SKIP_SYNC:-}" ]; then
+  inspect_seed "$WORKSPACE" "$MANIFEST_URL" "$REPO_ROOT/image/manifest/arcadia-x86.pinned.xml"
+fi
+
 # Resolve the revision to build from the committed pin, so this script never
 # builds something other than what X1 locked.
 MANIFEST_REVISION="${MANIFEST_REVISION:-$(python3 -c "import json;print(json.load(open('image/manifest/arcadia-x86.pin.json'))['manifest']['revision'])")}"
@@ -153,6 +287,10 @@ if [ -z "${SKIP_SYNC:-}" ]; then
   printf 'manifests checkout: %s\n' "$pinned_manifests"
   [ "$pinned_manifests" = "$MANIFEST_REVISION" ] \
     || die "manifests checkout is $pinned_manifests, expected $MANIFEST_REVISION"
+  # HEAD is not enough: `checkout --detach` carries local modifications across, so a
+  # dirty worktree reaches the right revision with the wrong content and the check
+  # above still passes. emberbird-pinned.xml is ours and expected below.
+  manifests_clean .repo/manifests emberbird-pinned.xml
 
   # THE ARCHITECTURAL FIX (root cause of jobs 302004 / 302127).
   #

@@ -28,6 +28,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=lib-audit.sh
 source "$HERE/lib-audit.sh"
 # Fixtures below create revisions. Most environments can; a sandboxed one may refuse
@@ -398,6 +399,148 @@ STUB
   STUB_REPO_BODY="" STUB_REPO_RC=0 resolve_witness "$W" >/dev/null 2>&1 \
     && echo "  [FAIL] an empty witness file was accepted as a resolution" && fail=1 \
     || echo "  [PASS] repo exiting 0 without writing anything is not a resolution"
+fi
+
+echo "-- 12. preflight: a .repo we cannot reuse, and a foreign base, are caught EARLY"
+# inspect_seed runs before the multi-hour sync. The states it refuses are the ones where
+# `repo init` would build a hybrid nobody downstream can verify; the foreign-base case
+# is reported rather than refused, because re-pointing a pre-seeded Crave node is the
+# supported path (and is what 302748 actually relied on).
+OUR_URL="https://github.com/BlissRoms-x86/manifest.git"
+SEED_LOCK="$REPO_ROOT/image/manifest/arcadia-x86.pinned.xml"
+
+mkseed() { # $1 = name -> prints a workspace path with a .repo/manifests git checkout
+  local ws="$T/$1"
+  mkdir -p "$ws"
+  printf '%s\n' "$ws"
+}
+
+expect_die() { # $1 = label, rest = command
+  local label="$1"; shift
+  local out rc=0
+  out="$("$@" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q FATAL; then
+    echo "  [PASS] $label"
+  else
+    echo "  [FAIL] $label (rc=$rc, out: $(printf '%s' "$out" | head -1))"; fail=1
+  fi
+}
+
+if ! type -t inspect_seed >/dev/null; then
+  echo "  [FAIL] the recipe no longer defines inspect_seed()"; fail=1
+else
+  # Cold runner: nothing there, must not complain.
+  cold="$(mkseed cold)"
+  if out="$(inspect_seed "$cold" "$OUR_URL" "$SEED_LOCK" 2>&1)" && printf '%s' "$out" | grep -q 'seed: none'; then
+    echo "  [PASS] a cold runner is not treated as a problem"
+  else
+    echo "  [FAIL] cold runner: $out"; fail=1
+  fi
+
+  # A .repo with no manifests worktree cannot be reused by repo.
+  broken="$(mkseed broken)"
+  mkdir -p "$broken/.repo"
+  expect_die "a .repo with no .repo/manifests is refused" inspect_seed "$broken" "$OUR_URL" "$SEED_LOCK"
+
+  # manifest.xml that is not XML: repo would sync against something unreadable.
+  badxml="$(mkseed badxml)"
+  mkdir -p "$badxml/.repo/manifests"
+  git -C "$badxml/.repo/manifests" init -q
+  printf 'this is not xml\n' > "$badxml/.repo/manifest.xml"
+  expect_die "an unparseable .repo/manifest.xml is refused" inspect_seed "$badxml" "$OUR_URL" "$SEED_LOCK"
+
+  # Foreign base: reported, not fatal, unless REQUIRE_CLEAN_SEED is set.
+  foreign="$(mkseed foreign)"
+  mkdir -p "$foreign/.repo/manifests"
+  git -C "$foreign/.repo/manifests" init -q
+  git -C "$foreign/.repo/manifests" remote add origin https://github.com/accupara/los20.git
+  git -C "$foreign/.repo/manifests" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+  printf '<manifest/>\n' > "$foreign/.repo/manifest.xml"
+  out="$(inspect_seed "$foreign" "$OUR_URL" "$SEED_LOCK" 2>&1)" || {
+    echo "  [FAIL] a foreign base should be reported, not fatal: $out"; fail=1; }
+  if printf '%s' "$out" | grep -q 'FOREIGN BASE'; then
+    echo "  [PASS] a foreign base is reported before the sync"
+  else
+    echo "  [FAIL] foreign base not reported: $out"; fail=1
+  fi
+  if out="$(REQUIRE_CLEAN_SEED=1 inspect_seed "$foreign" "$OUR_URL" "$SEED_LOCK" 2>&1)" ; then
+    echo "  [FAIL] REQUIRE_CLEAN_SEED=1 did not refuse a foreign base"; fail=1
+  else
+    echo "  [PASS] REQUIRE_CLEAN_SEED=1 refuses a foreign base"
+  fi
+
+  # Normalisation: a trailing .git / slash / different case is still OUR base.
+  ours="$(mkseed ours)"
+  mkdir -p "$ours/.repo/manifests"
+  git -C "$ours/.repo/manifests" init -q
+  git -C "$ours/.repo/manifests" remote add origin https://github.com/BlissRoms-X86/Manifest.git/
+  git -C "$ours/.repo/manifests" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+  printf '<manifest/>\n' > "$ours/.repo/manifest.xml"
+  out="$(inspect_seed "$ours" "$OUR_URL" "$SEED_LOCK" 2>&1)"
+  if printf '%s' "$out" | grep -q 'FOREIGN BASE'; then
+    echo "  [FAIL] our own base was misreported as foreign (url normalisation is broken)"; fail=1
+  else
+    echo "  [PASS] our own base is not misreported as foreign"
+  fi
+fi
+
+echo "-- 13. preflight: a dirty manifests worktree is caught even when HEAD matches"
+# THE hole this closes: `git checkout --detach <sha>` carries local modifications
+# across when they do not conflict, so HEAD reaches the pinned revision while the
+# manifest in use does not. The recipe's existing guard is a rev-parse HEAD
+# comparison, which PASSES in exactly that case.
+if ! type -t manifests_clean >/dev/null; then
+  echo "  [FAIL] the recipe no longer defines manifests_clean()"; fail=1
+else
+  MC="$T/manifests-clean"
+  mkdir -p "$MC"
+  git -C "$MC" init -q
+  printf 'original\n' > "$MC/default.xml"
+  git -C "$MC" add default.xml
+  git -C "$MC" -c user.email=t@t -c user.name=t commit -q -m init
+
+  # Clean tree, and the one untracked file the recipe drops in on purpose.
+  # NOTE the subshells: the recipe's `die` calls `exit`, so invoking these guards
+  # directly would terminate this test script on the first failure instead of
+  # recording it. Same contract as the recipe, isolated to one command.
+  if ( manifests_clean "$MC" emberbird-pinned.xml ) >/dev/null 2>&1; then
+    echo "  [PASS] a clean manifests worktree passes"
+  else
+    echo "  [FAIL] a clean worktree was rejected"; fail=1
+  fi
+  printf 'pinned\n' > "$MC/emberbird-pinned.xml"
+  if ( manifests_clean "$MC" emberbird-pinned.xml ) >/dev/null 2>&1; then
+    echo "  [PASS] the recipe's own emberbird-pinned.xml is allowed"
+  else
+    echo "  [FAIL] our own emberbird-pinned.xml was rejected"; fail=1
+  fi
+  rm -f "$MC/emberbird-pinned.xml"
+
+  # A MODIFIED tracked file at the right HEAD - the silent provenance hole.
+  printf 'locally edited\n' > "$MC/default.xml"
+  head_now="$(git -C "$MC" rev-parse HEAD)"
+  out="$(manifests_clean "$MC" emberbird-pinned.xml 2>&1)" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'default.xml'; then
+    echo "  [PASS] a modified tracked file is refused, and named"
+  else
+    echo "  [FAIL] dirty manifests accepted (rc=$rc): $(printf '%s' "$out" | head -2)"; fail=1
+  fi
+  # Prove the existing HEAD guard would NOT have caught it.
+  if [ "$head_now" = "$(git -C "$MC" rev-parse HEAD)" ]; then
+    echo "  [PASS] HEAD is unchanged - so rev-parse HEAD alone would NOT have caught this"
+  else
+    echo "  [FAIL] test setup wrong: HEAD moved"; fail=1
+  fi
+  git -C "$MC" checkout -q -- default.xml
+
+  # An untracked file that is NOT ours is debris and must not survive.
+  printf 'debris\n' > "$MC/random-junk.txt"
+  if ( manifests_clean "$MC" emberbird-pinned.xml ) >/dev/null 2>&1; then
+    echo "  [FAIL] unrelated untracked debris was accepted"; fail=1
+  else
+    echo "  [PASS] unrelated untracked debris is refused"
+  fi
+  rm -f "$MC/random-junk.txt"
 fi
 
 echo
