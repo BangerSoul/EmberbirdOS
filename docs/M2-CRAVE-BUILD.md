@@ -526,6 +526,25 @@ the pre-fix recipe. Still outstanding for the next submission: `inspect_seed` re
 foreign base but does not refuse it by default, so this class of node is still discovered
 by a ~8-minute job rather than by preflight.
 
+## Submitted 2026-10-04: job 303483 queued (`0e89318`, wrapper hardening)
+
+Job **303483** was launched from the branch with the three fixes above (`0e89318`, PR #7),
+project 36 / `linux16`, and sat **queued** at the time of writing, into a free slot via
+the one-build-at-a-time guard. The resubmission risk is unchanged and documented above:
+the node's foreign-base `.repo` seed is still only *reported* by preflight, not refused,
+so the same ~8-minute foreign-base failure as 303324 remains possible until
+`inspect_seed` is escalated to fatal.
+
+Two things the hardening already changed about a submission:
+
+- `run` pinned the recipe to the branch tip (`0e89318`) only after the push — the 302852
+  lesson (launch before the fix is on GitHub) is now enforced by the origin-reachability
+  guard rather than by memory.
+- `status` against the live job shows the queued row **and** the client's interleaved
+  `Error: could not get matching git url` diagnostic, and exits 1 rather than claiming a
+  clean answer — this machine's client prints that error even when it answers, and
+  "answered partially" is now distinguishable from "answered".
+
 ## Executed 2026-09-30: job 302748 ran and FAILED (the pre-seeded-tree trap, now closed)
 
 Job **302748** (`0fc8173`, the fix for the failure below) queued ~11h and FAILED in
