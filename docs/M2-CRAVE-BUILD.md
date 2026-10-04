@@ -92,8 +92,9 @@ From a checkout of this repository:
 bash tools/crave/run-remote-build.sh run
 
 # watch it / read the whole remote log
-# `status` EXITS NONZERO when the client could not answer, so it is safe in a script.
-# JOB=<id> pins the lookup; without it the id recorded by `run` is used.
+# `status`, `log` and `pull` EXIT NONZERO when the client could not answer, so they
+# are safe in scripts. All three pin the job id ($JOB, else the id recorded by `run`),
+# and all three refuse to run at all when there is neither - no unpinned fallbacks.
 bash tools/crave/run-remote-build.sh status
 bash tools/crave/run-remote-build.sh log
 
@@ -452,7 +453,7 @@ Resubmitted 2026-10-01 as job **303004**, pinned to `ded56c9` — this fix. Veri
 queued payload from `list --json` (`jobs_active[0].workspace.cmd` names the commit): the
 plain-text `crave list` table can show a stale payload, so JSON is the check that counts.
 
-### `status` was three lines that could not fail (fixed 2026-10-03)
+### `status`, `log` and `pull` could not fail (fixed 2026-10-03 and 2026-10-04)
 
 Diagnosing 303324 meant asking the client what it thought, and the command meant to do
 that had never worked:
@@ -488,8 +489,23 @@ at all*, in which case it says the state is **UNKNOWN** rather than guessing.
 Verified live against job 303324 — it now fetches that job's pinned log and **exits 1**
 with `client error: could not get matching git url` and the `UNKNOWN` state, where the
 old version printed an empty table and exited 0. Pinned offline by
-`tools/checks/test-crave-remote-build.sh` (15 assertions against a stub client that
-records the argv it was called with), which is red against the previous version.
+`tools/checks/test-crave-remote-build.sh` (then 15 assertions against a stub client
+that records the argv it was called with), which is red against the previous version.
+
+`log` and `pull` still carried the unpinned fallbacks after that fix, so on 2026-10-04
+they got the same treatment: both refuse to run without a job id instead of falling
+back to whichever job the current directory resolves to, both judge the client on its
+exit status and its text, and both exit nonzero with the reason named. `log` still
+streams whatever it received — a client error message is the most useful thing to show
+an operator who asked for a log — it just can no longer exit 0 while doing it. `pull`
+now also clears the ticket's `eb/image/out/` before fetching: the copy + verify steps
+below it would otherwise hash whatever the PREVIOUS pull left in the ticket and
+present it as this job's record — the artifact-level version of the self-witnessing
+that §2c documents for the audit. The stub client gained a `pull` mode and the same
+test file now pins all three subcommands (33 assertions); pointed at the pre-fix
+revision, the new assertions go red — including one that catches the old `pull`
+copying a stale `.iso` from a previous job into `image/out/`, where the X2 verifier
+then has to reject the whole record.
 
 `run` is now the only subcommand that requires `origin/$branch` to be reachable, since
 it is the only one that launches anything; refusing to report the status of a job that

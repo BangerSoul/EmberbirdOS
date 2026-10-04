@@ -40,7 +40,7 @@ command.
 | X2 evidence, verifier contract | `../manifest/test-verify-x2-provenance.py` | that the check above *fails* on a stale, truncated, unrecorded, traversing or wrong-build record, and that an empty artifact list is a failure rather than a vacuous pass |
 | build recipe | `test-build-recipe.py` | the recipe's two embedded Python heredocs, artifact discovery, and the completeness constants it shares with the lock |
 | revision audit | `test-revision-audit.sh` | the recipe's verification guards extracted *verbatim* by `lib-audit.sh`: `revision_audit()` (per-project tag resolution, a tag one repository has and another does not, and the 303324 regression — a `repo manifest -r` witness corroborates the verdict and can never produce it), `sanitize_worktrees()`, `resolve_witness()` (refresh ordering + a stubbed `repo`), and the preflight pair `inspect_seed()` / `manifests_clean()` against synthetic `.repo` trees |
-| crave wrapper | `test-crave-remote-build.sh` | `run-remote-build.sh`'s `status`, driven end-to-end against a **stub** client on `CRAVE_SHIM` that records the argv it was called with: that `getlog` is pinned with `--jobID`/`--projectID`, that the real section headers (`Your active jobs:` / `Job History:`) are parsed and other tables are not, that "left the queue" is distinguished from "the client drew no table", and that a client `Error:` line or nonzero exit makes the command exit nonzero |
+| crave wrapper | `test-crave-remote-build.sh` | `run-remote-build.sh`'s `status`, `log` and `pull`, driven end-to-end against a **stub** client on `CRAVE_SHIM` that records the argv it was called with: that every client call is pinned (`getlog --projectID/--jobID`, `pull --projectID/--job`), that the real section headers (`Your active jobs:` / `Job History:`) are parsed and other tables are not, that "left the queue" is distinguished from "the client drew no table", that a client `Error:` line or nonzero exit makes the command exit nonzero, that all three refuse to run without a job id (and make no client call at all), and that `pull` clears the ticket's staging dir first so a previous job's artifacts can never be copied and verified as this job's |
 | fixture git | `lib-fixtures.sh` + `git-shim.sh` | whether this environment's git can record a revision at all; when it cannot, the shim stands in so the audit still runs against real revisions instead of a field of unborn HEADs |
 | PowerShell, static | `check-powershell-static.py` | ASCII purity, delimiter pairing, no dangling refs to removed symbols, and the launcher's deliberate `-DryRun` fast path |
 | shellcheck | `run-offline-checks.sh` | every shell script, when shellcheck is installed (informational: it is neither pinned nor installed project-wide, so it never reds a run) |
@@ -117,12 +117,16 @@ git show HEAD~1:tools/crave/run-remote-build.sh > /tmp/old-crave.sh
 EMBERBIRD_CRAVE_RUNNER=/tmp/old-crave.sh bash tools/checks/test-crave-remote-build.sh  # must FAIL
 ```
 
-One honest limit on that control: the previous `run-remote-build.sh` had no
-`CRAVE_SHIM` override, so pointing the test at it makes the script call the **real**
-client. It still goes red on the substantive assertions (`--jobID` not passed, no rows
-shown, the client's error text swallowed), but its exit code is then that of a real
-API round-trip rather than of the stub, so treat the control as evidence about
-*behaviour*, not about exit codes.
+One honest limit on that control: which previous revision you point at decides what it
+can prove. The revision before the `status` fix (`6e09b54`) had no `CRAVE_SHIM`
+override, so pointing the test at it makes the script call the **real** client — it
+goes red on the substantive assertions, but its exit code is then that of a real API
+round-trip rather than of the stub, so treat that control as evidence about
+*behaviour*, not exit codes. The revision after it (`51177d8`: status fixed, `log` and
+`pull` still soft) has the override, so the same control drives the stub end to end
+and goes red on the `log`/`pull` assertions for exactly the right reasons: unpinned
+fallbacks, swallowed client errors, and a stale `.iso` from a previous pull copied
+into `image/out/`.
 
 Anything the previous commit was missing must go red, for the right reason, *without
 aborting the run* -- a check that crashes the suite instead of reporting a failure hides

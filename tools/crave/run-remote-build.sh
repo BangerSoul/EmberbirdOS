@@ -24,6 +24,12 @@
 #   bash tools/crave/run-remote-build.sh pull     # fetch image/out/* back into this repo
 #   bash tools/crave/run-remote-build.sh stop     # stop the job on this workspace
 #
+# `status`, `log` and `pull` are all PINNED to a job id ($JOB, else the record `run`
+# wrote to image/out/crave-job.txt) and all EXIT NONZERO when the client cannot answer
+# or answers with an error on its data stream: "I could not look" must never print as
+# "nothing is wrong". See the status block below and docs/M2-CRAVE-BUILD.md for the
+# failure history that forced each of these.
+#
 # `watch` exists because a free-queue job can sit `queued` for a long time waiting for a
 # build node (observed 2026-09-24 on linux16 - the free queue costs no tokens, it is just
 # a wait for capacity), and a multi-hour sync+build follows even once it starts. It polls,
@@ -386,24 +392,71 @@ case "$cmd" in
     ;;
 
   log)
+    # The same two defects `status` had (see the status block for the full story):
+    # an unpinned `getlog` fallback when no job id was found, and no judgement of
+    # what the client printed. `log` is what you reach for when `status` says the
+    # job failed - it must never answer with whichever job the current directory
+    # happens to resolve to, and it must never present a client error as a build
+    # log. It streams whatever it got either way: a client error message IS the
+    # most useful thing to show an operator who asked for a log.
     ensure_ticket >/dev/null
     j="$(job_record)"
-    if [ -n "$j" ]; then
-      ( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" getlog --projectID "$CRAVE_PROJECT_ID" --jobID "$j" )
+    [ -n "$j" ] || die "no job id: set JOB=<id>, or run 'run' first so image/out/crave-job.txt exists"
+    log "log for job $j ($CRAVE_PROJECT_NAME, project $CRAVE_PROJECT_ID)"
+    rc=0
+    if out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" getlog --projectID "$CRAVE_PROJECT_ID" --jobID "$j" 2>&1 | tr -d '\r' )"; then
+      :
     else
-      ( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" getlog )
+      rc=$?
     fi
+    if [ "$rc" -ne 0 ]; then
+      printf 'client error: `crave getlog --projectID %s --jobID %s` exited %s\n' "$CRAVE_PROJECT_ID" "$j" "$rc" >&2
+      rc=1
+    fi
+    # The client's diagnostics ride the same stream as its data and it does not
+    # reliably set a nonzero status (observed: "Error: could not get matching git
+    # url ..." with exit 0). A column-0 Error:/FATAL: line is therefore treated as
+    # a client diagnostic - the same heuristic `status` applies to the tables. The
+    # worst case is a false alarm on build output that opens a line that way; the
+    # log is printed either way, and erring toward "do not trust this output" is
+    # the direction that has been right every time so far.
+    if printf '%s\n' "$out" | grep -qE '^(Error|FATAL):'; then
+      printf 'client error: %s\n' "$(printf '%s\n' "$out" | grep -m1 -E '^(Error|FATAL):')" >&2
+      rc=1
+    fi
+    printf '%s\n' "$out"
+    if [ "$rc" -ne 0 ]; then
+      printf '(exit nonzero: the client could not fully answer - see the client errors above)\n' >&2
+    fi
+    exit "$rc"
     ;;
 
   pull)
+    # Same treatment as status/log (see the status block): pin the job, refuse
+    # without one, and judge the client on its exit status AND its text. A pull
+    # that failed must also never fall through into the copy + verify steps below:
+    # those would hash whatever the PREVIOUS pull left in the ticket and present
+    # it as this job's record - the artifact-level version of the self-witnessing
+    # the revision audit used to do.
     ensure_ticket >/dev/null
     j="$(job_record)"
-    if [ -n "$j" ]; then
-      log "pulling eb/image/out/ (job $j) from the remote workspace into $REPO_ROOT/image/out"
-      ( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" pull --projectID "$CRAVE_PROJECT_ID" --job "$j" eb/image/out/ )
+    [ -n "$j" ] || die "no job id: set JOB=<id>, or run 'run' first so image/out/crave-job.txt exists"
+    log "pulling eb/image/out/ (job $j) from the remote workspace into $REPO_ROOT/image/out"
+    # Start from nothing: if the pull fails or brings nothing back, the directory
+    # check below must report that, not find the last job's leftovers.
+    rm -rf "$TICKET_DIR/eb/image/out"
+    rc=0
+    if out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" pull --projectID "$CRAVE_PROJECT_ID" --job "$j" eb/image/out/ 2>&1 | tr -d '\r' )"; then
+      :
     else
-      log "pulling eb/image/out/ from the remote workspace into $REPO_ROOT/image/out"
-      ( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" pull eb/image/out/ )
+      rc=$?
+    fi
+    printf '%s\n' "$out"
+    if [ "$rc" -ne 0 ]; then
+      die "client error: \`crave pull --projectID $CRAVE_PROJECT_ID --job $j\` exited $rc - nothing was pulled; check 'status' before retrying"
+    fi
+    if printf '%s\n' "$out" | grep -qE '^(Error|FATAL):'; then
+      die "client error: $(printf '%s\n' "$out" | grep -m1 -E '^(Error|FATAL):') - the client exited 0 but reported an error; nothing was pulled"
     fi
     src="$TICKET_DIR/eb/image/out"
     if [ -d "$src" ]; then
