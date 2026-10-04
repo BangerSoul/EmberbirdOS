@@ -470,15 +470,17 @@ PY
   fi
   log "sync complete: all $total active manifest projects present on disk"
 
-  # Ask repo what every project resolves to, and audit against that.
+  # Ask repo what every project is checked out at, and audit the tree against the
+  # LOCK. The witness is corroboration, never the yardstick.
   #
-  # The lock pins 872 of its 1175 active projects to refs/tags/android-12.1.0_r22, and
-  # an AOSP release tag is a DIFFERENT commit in every repository - so a tag pin can
-  # only be settled by repo's own revision resolution, not by re-deriving one in a
-  # shell heredoc. `repo manifest -r` IS that resolution, and it is already the
-  # artifact the provenance record names as the build-side witness. Generate it here
-  # so the audit compares on-disk HEAD against repo's answer instead of guessing
-  # (see revision_audit's $2).
+  # The lock pins 872 of its 1175 active projects to refs/tags/android-12.1.0_r22,
+  # and an AOSP release tag is a DIFFERENT commit in every repository, so the audit
+  # resolves each such pin inside the project that pins it (see revision_audit).
+  # `repo manifest -r` is still generated, because it is the artifact the provenance
+  # record names as the build-side witness and the one verify-lock.py checks - but
+  # it reports what the tree ALREADY holds, so using it as the audit's reference
+  # answer would compare the disk with itself. That bug printed OK on a tree with
+  # 190 drifted projects in job 303324.
   #
   # This is called a THIRD time after any repair - see below, and resolve_witness for
   # why a witness that has been around since before a `repo sync` is worse than none.
@@ -490,13 +492,12 @@ PY
     # must never stop the build.
     #
     # ON AN OPTIONAL FAILURE THE WITNESS IS REMOVED, not kept. A witness we could
-    # not refresh describes a tree that no longer exists, and both ways that goes
-    # wrong are worse than simply having none: the audit would judge the current
-    # tree against a stale yardstick, which can either invent drift on a perfectly
-    # good tree or wave through one that genuinely moved. Dropping it costs
-    # precision - every project then falls back to resolving its pin in its own
-    # checkout, which is the same commit repo would name - and buys certainty that
-    # no comparison uses a value from the wrong moment.
+    # not refresh describes a tree that no longer exists, and a stale corroborating
+    # reading is worse than none: it would either accuse a perfectly good tree of
+    # disagreeing with the lock, or reassure the reader about a tree it never saw.
+    # Dropping it costs one line of independent cross-checking - the audit still
+    # judges every project from the lock - and buys certainty that no reported
+    # comparison comes from the wrong moment.
     local out="$1" mode="${2:-optional}"
     rm -f "$out"
     if repo manifest -r -o "$out" && [ -s "$out" ]; then
@@ -509,11 +510,11 @@ PY
     if [ "$mode" = "required" ]; then
       die "repo manifest -r failed - the synced tree is missing or cannot resolve a project the frozen lock references (see the sync-completeness step above), so the canonical X1 witness cannot be produced."
     fi
-    echo "note: repo manifest -r could not resolve every project; the audit will resolve each pin in its own checkout instead (the canonical witness check below is mandatory and runs regardless)"
+    echo "note: repo manifest -r could not resolve every project; the audit will judge the tree from the lock alone, without corroboration (the canonical witness check below is mandatory and runs regardless)"
     return 1
   }
 
-  log "resolving the active manifest per project (repo manifest -r)"
+  log "generating the repo manifest -r witness (corroboration for the audit, and the artifact verify-lock.py checks)"
   resolved_manifest="$OUT_DIR/repo-manifest-r.xml"
   resolve_witness "$resolved_manifest" || true
 
@@ -534,11 +535,9 @@ PY
     # offender), echoes the first line to stdout for the build log, and exits
     # nonzero when anything on disk disagrees with the lock.
     #
-    # $2 is optional: the `repo manifest -r` output. When it is present and a
-    # project's revision is in it, that resolved commit is the yardstick - see
-    # below. When it is absent (or does not cover a project) the pin is resolved
-    # in the project's own git dir instead, which is the same answer for every
-    # tree whose refs survived.
+    # $2 is optional: the `repo manifest -r` witness, used for CORROBORATION ONLY.
+    # It is never the yardstick. See the block that builds `resolved` below - and
+    # the post-mortem in docs/M2-CRAVE-BUILD.md for what happens when it is.
     LOCK_XML="$LOCK_XML" WORKSPACE="$WORKSPACE" python3 - "$1" "${2:-}" <<'PY' || return $?
 import os, re, subprocess, sys, xml.etree.ElementTree as ET
 
@@ -552,7 +551,9 @@ root = ET.parse(os.environ["LOCK_XML"]).getroot()
 
 # A 40-hex pin names its own commit, so it needs no resolution at all. Anything
 # else (a tag) has to be resolved inside the project that pins it - see below.
-SHA_RE = re.compile(r"[0-9a-f]{40}")
+# Anchored, like verify-lock.py's own SHA_RE, so a revision is never judged by
+# the 40 hex characters that happen to sit inside it.
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 rows = []
 for p in root.findall("project"):
@@ -576,44 +577,72 @@ def git_in(project_path, *args):
     return out.stdout.strip() if out.returncode == 0 else None
 
 
-# The recipe hands us `repo manifest -r` when it could produce it. That is repo's
-# OWN revision resolution, and it is strictly better than anything re-derived here:
-# 872 of this lock's 1175 active projects are pinned to refs/tags/android-12.1.0_r22,
-# and an AOSP release tag is a DIFFERENT commit in every repository, so a tag pin can
-# only be settled by the resolution repo itself performed. Re-deriving it in a shell
-# heredoc is how this audit used to compare 872 correct projects against one arbitrary
-# repository's tag. Only entries repo actually resolved to a concrete commit are
-# taken; a revision left as a moving ref is ignored so it can never be used as a
-# yardstick (falling back is strictly better than comparing HEAD to refs/heads/*).
+# `repo manifest -r` is repo's own reading of the tree, and it is a CORROBORATING
+# witness - never the yardstick. This is the correction from job 303324, and the
+# reason is worth stating precisely, because the previous version of this block
+# asserted the opposite in a comment:
+#
+#     "repo resolved this pin; its answer is the lock's answer, by construction."
+#
+# That is false, and it is not a subtle one. `repo manifest -r` reports the
+# revision each project is CHECKED OUT at, so for the 1175/1175 case it simply
+# echoed the disk back. Comparing on-disk HEAD to it therefore agreed by
+# construction and could not fail, no matter what the tree held. On 303324 the
+# seed was LOS 20 content (a foreign-base .repo that resync.sh never repaired),
+# 190 SHA-pinned projects sat at the wrong commits and 8 were absent - and this
+# audit still printed "OK all 1175 active projects on disk at their locked
+# revisions (1175/1175 resolved via repo manifest -r)", one screen above
+# verify-lock.py refusing the same tree on the same witness file. A verdict that
+# cannot disagree is not a verdict. So: the LOCK decides, every time.
+#
+# What the witness is still good for, and is used for here:
+#   * an independent second reading of each project's revision, which is
+#     cross-checked against the lock and reported (see witness_* counters), and
+#   * coverage - which lock projects the tree never mentioned at all.
+# A disagreement is surfaced loudly; it never rescues a project, because letting
+# it do that would just reintroduce the tautology one level down.
+#
+# Only entries repo resolved to a concrete 40-hex commit are usable; a revision
+# left as a moving ref is recorded as "seen, unresolved" and not used as a value.
 resolved = {}
-resolved_arg = sys.argv[2] if len(sys.argv) > 2 else ""
-if resolved_arg and os.path.exists(resolved_arg):
+witness_seen = set()
+witness_arg = sys.argv[2] if len(sys.argv) > 2 else ""
+if witness_arg and os.path.exists(witness_arg):
     try:
-        rroot = ET.parse(resolved_arg).getroot()
+        rroot = ET.parse(witness_arg).getroot()
     except ET.ParseError as exc:
-        print("note: cannot parse %s (%s); resolving pins locally instead" % (resolved_arg, exc),
+        print("note: cannot parse %s (%s); the lock alone will judge the tree" % (witness_arg, exc),
               file=sys.stderr)
         rroot = None
     if rroot is not None:
         for el in rroot.findall("project"):
             rpath = el.get("path") or el.get("name")
             rrev = el.get("revision") or ""
-            if rpath and SHA_RE.fullmatch(rrev):
+            if not rpath:
+                continue
+            witness_seen.add(rpath)
+            if SHA_RE.match(rrev):
                 resolved[rpath] = rrev
 
 
 missing = []
 mismatch = []
-# How much of this verdict rests on repo's own resolution, and how much on the
-# weaker per-project fallback. Reported on the OK line because a partial witness is
-# normal on a depth-1 pre-seeded tree, and "(resolved via repo manifest -r)" on its
-# own would read as "repo settled all of them" when it may have settled two.
-via_witness = 0
+# The yardstick is the lock, every time, so the breakdown below describes how each
+# pin in the LOCK was read - not how many projects the witness happened to cover.
+# The witness's own numbers are reported separately, because "1175/1175 resolved
+# via repo manifest -r" is exactly the sentence that hid a 190-project drift.
 sha_pins = 0
 in_project = 0
+witness_ok = 0
+witness_conflict = 0
+witness_no_entry = 0
+notes = []
 for path, rev in rows:
     if not os.path.exists(os.path.join(ws, path, ".git")):
         missing.append(path)
+        if witness_arg and path not in witness_seen:
+            notes.append("note %s has no checkout AND no repo manifest -r entry - the "
+                         "tree's manifest does not carry this project at all" % path)
         continue
     head = git_in(path, "rev-parse", "HEAD")
     if head is None:
@@ -622,19 +651,28 @@ for path, rev in rows:
     if not rev:
         mismatch.append((path, "lock entry carries no revision"))
         continue
-    if path in resolved:
-        # repo resolved this pin; its answer is the lock's answer, by construction.
-        want = resolved[path]
-        via_witness += 1
-    elif SHA_RE.fullmatch(rev):
-        # A SHA names its own commit, so it is never in doubt and needs no witness.
+    # THE LOCK IS THE YARDSTICK. Both arms below derive `want` from the lock and
+    # from nothing else; the witness is never consulted to produce it.
+    if SHA_RE.match(rev):
+        # A SHA names its own commit. There is no resolution step to get wrong.
         want = rev
         sha_pins += 1
     else:
-        # No resolved manifest for this project: resolve the pin in the project's own
-        # git dir, which is what repo would do for it too.
+        # A tag pin names a DIFFERENT commit in every repository, so it has to be
+        # resolved in the project that pins it. Resolving it HERE - in that
+        # project's own git dir, with that project's own refs - is the same thing
+        # repo does when it checks the revision out, and it is the resolution
+        # that is independent of the current on-disk HEAD. (The old bug's
+        # rationale, "re-deriving it in a shell heredoc", was really about
+        # resolving a tag ONCE in some other repository and applying that single
+        # answer to all 872 tag-pinned projects. Doing it per project, in the
+        # project itself, is not that.)
         want = git_in(path, "rev-parse", rev + "^{commit}")
         if not want:
+            # Fail closed: an unresolvable pin is an unproven pin. If the tag ref
+            # is not in the checkout (a depth-1 seed may not have it), we cannot
+            # show this project is at its locked revision, so we do not claim it
+            # is. The re-sync below is what brings the object in.
             mismatch.append(
                 (path, "lock pins %s but this project's own checkout does not resolve it" % rev)
             )
@@ -642,6 +680,17 @@ for path, rev in rows:
         in_project += 1
     if head != want:
         mismatch.append((path, "on-disk %s, locked %s (%s)" % (head[:12], want[:12], rev[:28])))
+    # Corroboration only, and only after the lock has already had its say.
+    if witness_arg:
+        if path in resolved:
+            if resolved[path] == want:
+                witness_ok += 1
+            else:
+                witness_conflict += 1
+                notes.append("note %s repo manifest -r says %s but the lock says %s (%s) - "
+                             "the lock governs" % (path, resolved[path][:12], want[:12], rev[:28]))
+        else:
+            witness_no_entry += 1
 
 lines = []
 if not missing and not mismatch:
@@ -650,14 +699,14 @@ if not missing and not mismatch:
     # whether the tree was actually proven by repo - rather than by a local fallback
     # on a shallow tree - has to be able to tell the difference from one line.
     how = []
-    if via_witness:
-        how.append("%d/%d resolved via repo manifest -r" % (via_witness, len(rows)))
-    else:
-        how.append("no repo manifest -r witness")
     if sha_pins:
-        how.append("%d SHA pins" % sha_pins)
+        how.append("%d SHA pins compared directly against the lock" % sha_pins)
     if in_project:
-        how.append("%d resolved in-project" % in_project)
+        how.append("%d tag pins resolved in-project" % in_project)
+    if not witness_arg or not witness_seen:
+        how.append("no repo manifest -r witness to corroborate")
+    else:
+        how.append("repo manifest -r corroborates %d/%d" % (witness_ok, witness_ok + witness_conflict + witness_no_entry))
     lines.append(
         "OK all %d active projects on disk at their locked revisions (%s)"
         % (len(rows), ", ".join(how))
@@ -669,6 +718,13 @@ else:
     if mismatch:
         lines.append("MISMATCH %d (checkout content differs from the lock)" % len(mismatch))
         lines.extend("mismatch %s %s" % (path, why) for path, why in mismatch)
+# The caller turns lines starting with "missing "/"mismatch " into a scoped repo
+# sync, so note lines must not be mistakable for offenders. They never are - and
+# they go to stderr as well, because a witness that contradicts the lock is worth
+# seeing in the build log even when the tree passes.
+lines.extend(notes)
+for n in notes:
+    print(n, file=sys.stderr)
 
 report = sys.argv[1] if len(sys.argv) > 1 else "-"
 text = "\n".join(lines) + "\n"

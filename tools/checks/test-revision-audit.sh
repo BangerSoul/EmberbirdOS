@@ -11,7 +11,10 @@
 #   7. sanitize_worktrees() clears local modifications/untracked files that would
 #      make the forced re-sync's checkout abort;
 #   8. sanitize_worktrees() survives a checkout whose HEAD never landed;
-#   9. the audit judges against a stubbed `repo manifest -r` when one is supplied.
+#   9. a stubbed `repo manifest -r` CORROBORATES the audit and never decides it -
+#      in particular, a witness that faithfully reports a drifted tree still yields
+#      MISMATCH (the job 303324 regression, and the reason the lock is the only
+#      yardstick).
 # WHY: job 302748 (2026-09-30) died at `lunch` because the Crave node's pre-seeded
 # tree held ~1000 lock paths at LOS 20 revisions while every other check in the
 # recipe reasoned about existence and files only. Job 302857 (2026-10-01) then died
@@ -265,64 +268,120 @@ fi
   && { echo "  [FAIL] untracked debris survived an unborn-HEAD sanitize"; fail=1; } \
   || echo "  [PASS] untracked debris removed even with no HEAD to reset to"
 
-echo "-- 9. the audit judges against repo's own resolution (stubbed repo manifest -r)"
-# The recipe hands the audit `repo manifest -r`, which resolves each pin the way repo
-# does. Two properties matter, and NEITHER is testable without a stub:
-#   a) a pin the project's own checkout can no longer resolve is still decidable,
-#      because repo's resolved answer stands in for it - this is the whole reason
-#      the recipe passes the witness in;
-#   b) when repo's answer disagrees with HEAD, HEAD is wrong - the audit must not
-#      rubber-stamp a tree just because a resolved manifest was supplied.
+echo "-- 9. the repo manifest -r witness CORROBORATES; it never decides"
+# The recipe hands the audit a `repo manifest -r` witness, and this scenario is the
+# whole correction from job 303324. That audit used a witness entry as the answer to
+# compare on-disk HEAD against, under the comment "repo resolved this pin; its
+# answer is the lock's answer, by construction" - which is false. `repo manifest -r`
+# reports the revision each project is CHECKED OUT at, so it echoes the disk; the
+# comparison agreed with itself and could not fail. It printed "OK all 1175 active
+# projects ... (1175/1175 resolved via repo manifest -r)" over a tree holding 190
+# wrong commits and 8 absent projects, one screen above verify-lock.py refusing the
+# same tree on the same witness file.
+#
+# So the witness is a corroborating second reading, never the yardstick, and all
+# four properties below are about that distinction:
+#   a) a pin the checkout can no longer resolve is still undecidable WITH a witness
+#      - the witness must not rescue it;
+#   b) a clean tree plus a witness that agrees with the lock is clean, and the
+#      report must say how much the witness actually corroborated;
+#   c) THE REGRESSION (303324): a tree drifted away from the lock, with a witness
+#      that faithfully reports the drift, is a MISMATCH - not OK;
+#   d) a witness that contradicts a clean tree cannot fail it either - it is
+#      reported, and the lock still governs.
 RESOLVED="$T/resolved.xml"
-stub_resolved() { # $1 = path whose resolved revision to corrupt (optional)
-  local bad="${1:-}"
+stub_witness() { # args: "<path> <revision>" pairs; a path may be repeated to override
+  rm -f "$RESOLVED"
   {
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<manifest>\n'
-    printf '  <project name="ok" path="ok" revision="%s" />\n' "$SHA_OK"
-    printf '  <project name="wrong" path="wrong" revision="%s" />\n' "$SHA_WRONG"
-    printf '  <project name="gone" path="gone" revision="%s" />\n' "$SHA_GONE2"
-    printf '  <project name="p_tag" path="tagged" revision="%s" />\n' "$SHA_TAG"
-    printf '  <project name="p_shared_a" path="shared_a" revision="%s" />\n' "$SHA_SHARED_A"
-    if [ "$bad" = "shared_b" ]; then
-      printf '  <project name="p_shared_b" path="shared_b" revision="%s" />\n' "$(printf 'f%.0s' $(seq 40))"
-    else
-      printf '  <project name="p_shared_b" path="shared_b" revision="%s" />\n' "$SHA_SHARED_B"
-    fi
+    for pair in "$@"; do
+      printf '  <project path="%s" revision="%s" />\n' "${pair%% *}" "${pair##* }"
+    done
     printf '</manifest>\n'
   } > "$RESOLVED"
 }
+FULL_WITNESS=( "ok $SHA_OK" "wrong $SHA_WRONG" "gone $SHA_GONE2" "tagged $SHA_TAG" \
+               "shared_a $SHA_SHARED_A" "shared_b $SHA_SHARED_B" )
 
-# Damage the one thing only repo's resolution can still answer: shared_b's local tag.
+# Damage shared_b's local tag, so the lock's refs/tags/android-12.1.0_r22 no longer
+# resolves inside the project that pins it. The lock itself is undamaged.
 git -C "$WORKSPACE/shared_b" tag -d "android-12.1.0_r22" >/dev/null
 
 R9a="$T/r9a.txt"
 run 3 "$R9a"
 if grep -q "does not resolve it" "$R9a"; then
-  echo "  [PASS] without the witness, an unresolvable local pin is undecidable"
+  echo "  [PASS] (a1) without a witness, an unresolvable local pin is undecidable"
 else
   echo "  [FAIL] expected 'does not resolve it', got: $(head -1 "$R9a")"; fail=1
 fi
 
-stub_resolved
+# The witness names a concrete commit for exactly that project. It must NOT become
+# the yardstick: a pin the checkout cannot resolve is still unproven, and letting
+# the witness vouch for it would reintroduce the tautology one level down.
+stub_witness "${FULL_WITNESS[@]}"
 R9b="$T/r9b.txt"
-run 0 "$R9b" "$RESOLVED"
-case "$(head -1 "$R9b")" in
-  "OK all 6 active projects"*) echo "  [PASS] with the witness, that same project is decidable";;
-  *) echo "  [FAIL] witness did not rescue the audit: $(head -1 "$R9b")"; fail=1;;
+run 3 "$R9b" "$RESOLVED"
+if grep -q "^mismatch shared_b .*does not resolve it" "$R9b"; then
+  echo "  [PASS] (a2) a witness entry does NOT rescue a pin the checkout cannot resolve"
+else
+  echo "  [FAIL] the witness overrode the lock: $(head -1 "$R9b")"; fail=1
+fi
+
+# Repair the tag; now the tree is clean and the witness agrees with the lock.
+git -C "$WORKSPACE/shared_b" tag "android-12.1.0_r22" "$SHA_SHARED_B"
+R9c="$T/r9c.txt"
+run 0 "$R9c" "$RESOLVED"
+case "$(head -1 "$R9c")" in
+  "OK all 6 active projects"*) echo "  [PASS] (b) a clean tree the witness corroborates is OK";;
+  *) echo "  [FAIL] clean corroborated tree: $(head -1 "$R9c")"; fail=1;;
 esac
-case "$(head -1 "$R9b")" in
-  *"repo manifest -r"*) echo "  [PASS] the report names the yardstick it used";;
-  *) echo "  [FAIL] report does not say it used the resolved manifest"; fail=1;;
+case "$(head -1 "$R9c")" in
+  *"repo manifest -r corroborates 6/6"*)
+    echo "  [PASS] (b) the report says how much the witness corroborated";;
+  *)
+    echo "  [FAIL] report does not report corroboration: $(head -1 "$R9c")"; fail=1;;
 esac
 
-stub_resolved shared_b
-R9c="$T/r9c.txt"
-run 3 "$R9c" "$RESOLVED"
-if grep -q "^mismatch shared_b " "$R9c"; then
-  echo "  [PASS] a resolved revision that disagrees with HEAD is caught"
-else
-  echo "  [FAIL] the audit accepted a tree the witness disagrees with: $(head -1 "$R9c")"; fail=1
-fi
+# (c) THE REGRESSION. Drift `wrong` off its locked SHA, and let the witness report
+# the drift - which is what repo genuinely sees. Pre-fix, `want` came from the
+# witness, so want == head and the audit said OK. This is 303324 in miniature.
+git -C "$WORKSPACE/wrong" -c user.email=t@t -c user.name=t commit -q --allow-empty -m drift2
+DRIFTED="$(git -C "$WORKSPACE/wrong" rev-parse HEAD)"
+stub_witness "${FULL_WITNESS[@]}" "wrong $DRIFTED"
+R9d="$T/r9d.txt"
+run 3 "$R9d" "$RESOLVED"
+case "$(head -1 "$R9d")" in
+  "MISMATCH 1 "*) echo "  [PASS] (c) a tree drifted from the lock is MISMATCH even when the witness agrees with disk";;
+  *) echo "  [FAIL] the audit trusted the witness over the lock: $(head -1 "$R9d")"; fail=1;;
+esac
+# The report abbreviates commits to 12 chars, so match on that prefix, not the
+# full sha - an assertion that never matches would read as a code failure.
+DRIFT12="${DRIFTED%${DRIFTED#????????????}}"
+LOCK12="${SHA_WRONG%${SHA_WRONG#????????????}}"
+grep -q "^mismatch wrong on-disk $DRIFT12, locked $LOCK12" "$R9d" \
+  && echo "  [PASS] (c) the mismatch names the drifted commit and the locked one" \
+  || { echo "  [FAIL] wrong mismatch line: $(grep '^mismatch ' "$R9d")"; fail=1; }
+grep -q "^note wrong repo manifest -r says $DRIFT12 but the lock says $LOCK12" "$R9d" \
+  && echo "  [PASS] (c) the witness disagreeing with the lock is reported, as a note" \
+  || { echo "  [FAIL] the witness disagreement was swallowed: $(cat "$R9d")"; fail=1; }
+git -C "$WORKSPACE/wrong" update-ref HEAD "$SHA_WRONG"   # restore for later scenarios
+
+# (d) A witness that contradicts an otherwise clean tree must not fail it - the
+# lock still governs - but the disagreement has to be visible in the report.
+BADREV="$(printf 'f%.0s' $(seq 40))"
+stub_witness "${FULL_WITNESS[@]}" "wrong $BADREV"
+R9e="$T/r9e.txt"
+run 0 "$R9e" "$RESOLVED"
+case "$(head -1 "$R9e")" in
+  "OK all 6 active projects"*) echo "  [PASS] (d) a contradicting witness cannot fail a clean tree";;
+  *) echo "  [FAIL] a witness vetoed the lock: $(head -1 "$R9e")"; fail=1;;
+esac
+case "$(head -1 "$R9e")" in
+  *"repo manifest -r corroborates 5/6"*)
+    echo "  [PASS] (d) and the report counts the disagreement instead of hiding it";;
+  *)
+    echo "  [FAIL] corroboration count hides the conflict: $(head -1 "$R9e")"; fail=1;;
+esac
 
 echo "-- 10. the recipe re-resolves the witness BEFORE the post-re-sync re-audit"
 # The control flow in the repair branch is not exercisable offline - it needs `repo`
