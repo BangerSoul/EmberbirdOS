@@ -59,7 +59,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CRAVE_SHIM="$REPO_ROOT/tools/crave/crave.sh"
+# Overridable so the offline suite can drive every subcommand against a stub client
+# (tools/checks/test-crave-remote-build.sh). Same convention as crave.sh's CRAVE_BIN.
+CRAVE_SHIM="${CRAVE_SHIM:-$REPO_ROOT/tools/crave/crave.sh}"
 
 CRAVE_PROJECT_ID="${CRAVE_PROJECT_ID:-36}"
 CRAVE_PROJECT_NAME="${CRAVE_PROJECT_NAME:-LOS 20}"
@@ -119,9 +121,16 @@ active_jobs() {
 repo_url="$(git -C "$REPO_ROOT" remote get-url origin)"
 branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
 COMMIT="${COMMIT:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+cmd="${1:-run}"
 # A window into a private repo would fail remotely; fail loudly here instead.
-git -C "$REPO_ROOT" ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1 \
-  || die "origin/$branch is not reachable - push before launching a build from it"
+# Scoped to `run`, because that is the only command that launches anything: refusing
+# to show the status of a job that already ran, just because this checkout's origin
+# is unreachable, is the wrong trade. It also keeps every read-only subcommand
+# offline, which is what lets the test suite drive them against a stub.
+if [ "$cmd" = "run" ]; then
+  git -C "$REPO_ROOT" ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1 \
+    || die "origin/$branch is not reachable - push before launching a build from it"
+fi
 
 # ------------------------------------------------------------------ the ticket ----
 # A checkout whose origin is the base project's URL: that is what makes `crave run`
@@ -257,7 +266,6 @@ WORKSPACE="\$ROOT" bash tools/guest-build/build-from-manifest.sh
 EOF
 }
 
-cmd="${1:-run}"
 case "$cmd" in
   run)
     ensure_ticket
@@ -296,9 +304,85 @@ case "$cmd" in
     ;;
 
   status)
+    # WHY THIS WAS REWRITTEN (it used to be three lines and told you nothing)
+    #   1. `sed -n '/Your jobs/,$p'` matched no header the client has ever printed.
+    #      The real ones are "Your active jobs:" and "Job History:" - so the queue
+    #      state was always empty, and an empty table looks exactly like "nothing to
+    #      report" rather than "the parse found nothing".
+    #   2. `getlog` carried no --jobID. Everywhere else in this script every log and
+    #      pull access is pinned (see WORKSPACE SCOPING at the top); unpinned, the
+    #      client resolves against the current directory's workspace and answers
+    #      "No running job found on this workspace" - which is how a healthy job
+    #      comes to look dead.
+    #   3. It exited 0 even when every client call failed. A `status` that cannot
+    #      reach the API must not report success: that is the difference between
+    #      "the job is gone" and "I could not look".
+    #
+    # The client's diagnostics arrive on the SAME stream as its data and it does not
+    # always set a nonzero status - observed `list` printing
+    #   Error: could not get matching git url at: C:/Users/<you>
+    # and still exiting 0. So each probe is judged on BOTH its exit status and its
+    # text, and any failure makes this command exit nonzero with the reason named.
     ensure_ticket >/dev/null
-    ( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" list | sed -n '/Your jobs/,$p' | head -8
-      bash "$CRAVE_SHIM" getlog 2>&1 | tail -25 )
+    j="$(job_record)"
+    [ -n "$j" ] || die "no job id: set JOB=<id>, or run 'run' first so image/out/crave-job.txt exists"
+    log "status for job $j ($CRAVE_PROJECT_NAME, project $CRAVE_PROJECT_ID)"
+    rc=0
+
+    # ---- queue state, from the table, for OUR job id only ----
+    if list_out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" list 2>&1 | tr -d '\r' )"; then
+      list_rc=0
+    else
+      list_rc=$?; rc=1
+    fi
+    if printf '%s\n' "$list_out" | grep -qE '^(Error|FATAL):'; then
+      printf '  client error: %s\n' "$(printf '%s\n' "$list_out" | grep -m1 -E '^(Error|FATAL):')"
+      rc=1
+    fi
+    if [ "$list_rc" -ne 0 ]; then
+      printf '  client error: `crave list` exited %s\n' "$list_rc"
+    fi
+    # Section-aware: both real headers, and any other "Word:" heading ends the
+    # current table so a project/platform table can never be read as a job row.
+    row="$(printf '%s\n' "$list_out" | awk -v j="$j" '
+        /^Your active jobs:/ { sec = "active";  next }
+        /^Job History:/     { sec = "history"; next }
+        /^[A-Za-z][A-Za-z ]*:[[:space:]]*$/ { sec = "" }
+        sec && $1 == j { print sec "\t" $0; exit }
+    ')"
+    # Split section from row BEFORE formatting: piping the formatted line through
+    # `cut -f2-` drops the field the prefix belongs to, silently deleting "queue:".
+    row_sec="${row%%$'\t'*}"
+    row_txt="${row#*$'\t'}"
+    case "$row_sec" in
+      active)
+        printf '  queue:    %s\n' "$row_txt" ;;
+      history)
+        printf '  queue:    finished - %s\n' "$row_txt" ;;
+      '')
+        # "not in either table" and "the client never drew one" are different facts
+        # and must not be reported the same way.
+        if printf '%s\n' "$list_out" | grep -qE '^(Your active jobs:|Job History:)'; then
+          printf '  queue:    job %s is in neither table - it has left the queue\n' "$j"
+        else
+          printf '  queue:    the client returned NO job table at all (it answered with projects/platforms only) - the state of job %s is UNKNOWN\n' "$j"
+        fi ;;
+    esac
+
+    # ---- log tail, PINNED to the job ----
+    if log_out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" getlog --projectID "$CRAVE_PROJECT_ID" --jobID "$j" 2>&1 | tr -d '\r' )"; then
+      log_rc=0
+    else
+      log_rc=$?; rc=1
+    fi
+    if [ "$log_rc" -ne 0 ]; then
+      printf '  client error: `crave getlog --jobID %s` exited %s\n' "$j" "$log_rc"
+      rc=1
+    fi
+    printf '  log tail:\n'
+    printf '%s\n' "$log_out" | tail -25 | sed 's/^/    /'
+    [ "$rc" -eq 0 ] || printf '  (status could not be fully determined - see the client errors above)\n'
+    exit "$rc"
     ;;
 
   log)

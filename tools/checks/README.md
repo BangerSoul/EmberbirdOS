@@ -39,7 +39,8 @@ command.
 | X2 evidence, pulled record | `../manifest/verify-x2-provenance.py` | that `image/out/x2-provenance.json` describes the artifacts actually on disk: every recorded hash and byte count matches, no unrecorded `.iso`/`.img` is sitting beside it, and `manifest_revision` equals the committed X1 pin |
 | X2 evidence, verifier contract | `../manifest/test-verify-x2-provenance.py` | that the check above *fails* on a stale, truncated, unrecorded, traversing or wrong-build record, and that an empty artifact list is a failure rather than a vacuous pass |
 | build recipe | `test-build-recipe.py` | the recipe's two embedded Python heredocs, artifact discovery, and the completeness constants it shares with the lock |
-| revision audit | `test-revision-audit.sh` | the recipe's verification guards extracted *verbatim* by `lib-audit.sh`: `revision_audit()` (per-project tag resolution, a tag one repository has and another does not, a stubbed `repo manifest -r` witness and its absence), `sanitize_worktrees()`, `resolve_witness()` (refresh ordering + a stubbed `repo`), and the preflight pair `inspect_seed()` / `manifests_clean()` against synthetic `.repo` trees |
+| revision audit | `test-revision-audit.sh` | the recipe's verification guards extracted *verbatim* by `lib-audit.sh`: `revision_audit()` (per-project tag resolution, a tag one repository has and another does not, and the 303324 regression — a `repo manifest -r` witness corroborates the verdict and can never produce it), `sanitize_worktrees()`, `resolve_witness()` (refresh ordering + a stubbed `repo`), and the preflight pair `inspect_seed()` / `manifests_clean()` against synthetic `.repo` trees |
+| crave wrapper | `test-crave-remote-build.sh` | `run-remote-build.sh`'s `status`, driven end-to-end against a **stub** client on `CRAVE_SHIM` that records the argv it was called with: that `getlog` is pinned with `--jobID`/`--projectID`, that the real section headers (`Your active jobs:` / `Job History:`) are parsed and other tables are not, that "left the queue" is distinguished from "the client drew no table", and that a client `Error:` line or nonzero exit makes the command exit nonzero |
 | fixture git | `lib-fixtures.sh` + `git-shim.sh` | whether this environment's git can record a revision at all; when it cannot, the shim stands in so the audit still runs against real revisions instead of a field of unborn HEADs |
 | PowerShell, static | `check-powershell-static.py` | ASCII purity, delimiter pairing, no dangling refs to removed symbols, and the launcher's deliberate `-DryRun` fast path |
 | shellcheck | `run-offline-checks.sh` | every shell script, when shellcheck is installed (informational: it is neither pinned nor installed project-wide, so it never reds a run) |
@@ -58,7 +59,10 @@ cannot be mistaken for one:
 * **QEMU boot and the X3-X5 evidence** need a WHPX-provisioned Windows host.
 * **`repo` itself** is not available here. The revision audit is exercised with a
   *stubbed* `repo manifest -r` (and its absence), so what is pinned is the audit's
-  decision logic -- not that a real `repo` emits the XML the recipe expects.
+  decision logic -- not that a real `repo` emits the XML the recipe expects. Note that
+  the stub can only tell you how the audit *treats* a witness: the finding behind job
+  303324 was that `repo manifest -r` reports what the tree already holds, so it is a
+  corroborating reading and never the yardstick. The stub is faithful to that contract.
 * **A real pulled image.** Until a Crave job has actually succeeded and
   `image/out/x2-provenance.json` exists, `verify-x2-provenance.py` exits **2** and the
   suite reports a `skip`. That is not a pass: it is how "there is no image yet" stays
@@ -104,9 +108,33 @@ git show HEAD~1:tools/guest-build/build-from-manifest.sh > /tmp/old.sh
 EMBERBIRD_RECIPE=/tmp/old.sh bash tools/checks/test-revision-audit.sh   # must FAIL
 ```
 
+The Crave wrapper's test honours the same idea under a different name,
+`EMBERBIRD_CRAVE_RUNNER`, because it drives the script itself rather than extracted
+fragments of it:
+
+```bash
+git show HEAD~1:tools/crave/run-remote-build.sh > /tmp/old-crave.sh
+EMBERBIRD_CRAVE_RUNNER=/tmp/old-crave.sh bash tools/checks/test-crave-remote-build.sh  # must FAIL
+```
+
+One honest limit on that control: the previous `run-remote-build.sh` had no
+`CRAVE_SHIM` override, so pointing the test at it makes the script call the **real**
+client. It still goes red on the substantive assertions (`--jobID` not passed, no rows
+shown, the client's error text swallowed), but its exit code is then that of a real
+API round-trip rather than of the stub, so treat the control as evidence about
+*behaviour*, not about exit codes.
+
 Anything the previous commit was missing must go red, for the right reason, *without
 aborting the run* -- a check that crashes the suite instead of reporting a failure hides
 the state of every scenario after it, which is the one thing this suite exists to prevent.
+
+This is how the 303324 regression test was validated rather than merely written. The
+pre-fix recipe, pointed at by `EMBERBIRD_RECIPE`, reports
+`OK all 6 active projects ... (6/6 resolved via repo manifest -r)` over a tree with a
+deliberately drifted project -- the same shape as the `OK all 1175 active projects ...
+(1175/1175 resolved via repo manifest -r)` that job 303324 printed over a tree with 190
+drifted projects. A regression test that passes against the code it was written to fix is
+decorative; this one was confirmed to fail against that code first.
 
 ## Rules for adding a check here
 

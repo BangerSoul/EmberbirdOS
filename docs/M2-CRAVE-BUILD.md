@@ -92,6 +92,8 @@ From a checkout of this repository:
 bash tools/crave/run-remote-build.sh run
 
 # watch it / read the whole remote log
+# `status` EXITS NONZERO when the client could not answer, so it is safe in a script.
+# JOB=<id> pins the lookup; without it the id recorded by `run` is used.
 bash tools/crave/run-remote-build.sh status
 bash tools/crave/run-remote-build.sh log
 
@@ -269,17 +271,65 @@ phantom drifts, and the audit could never pass its own post-re-sync re-audit. Ev
 project's pin is now resolved in **its own** checkout, with an explicit guard for a
 lock entry that carries no `revision` at all.
 
-**2. Now it asks `repo` instead of re-deriving the answer.** A tag pin can only be
-settled by the resolution `repo` itself performed, so the recipe generates
-`repo manifest -r` **before** the audit and hands it in. When a project appears in that
-witness, the audit compares on-disk `HEAD` against repo's resolved commit; a `revision`
-repo left as a moving ref is ignored rather than used as a yardstick. With no witness the
-per-project resolution is the fallback, so the pre-audit generation is non-fatal and can
-only make the audit more accurate, never unavailable. The `OK` line says which yardstick
-produced it and how much of it came from where — `(6/6 resolved via repo manifest -r,
-2 SHA pins, 4 resolved in-project)` — because a partial witness is *normal* on a
-depth-1 pre-seeded tree, and a bare "(resolved via repo manifest -r)" would read as
-"repo settled all of them" when it may have settled two.
+**2. Now it corroborates against `repo`, but the LOCK is still the only yardstick.**
+The witness `repo manifest -r` is generated before the audit and handed in — and it is
+used to *corroborate*, never to decide. An earlier version of this section said the
+opposite ("a tag pin can only be settled by the resolution `repo` itself performed", so
+compare `HEAD` against repo's resolved commit). That was wrong, and job 303324 is what
+proved it: see §2c. The `OK` line now reports the lock's own breakdown plus how much the
+witness corroborated — `OK all 6 active projects on disk at their locked revisions (3 SHA
+pins compared directly against the lock, 3 tag pins resolved in-project, repo manifest -r
+corroborates 6/6)`. A disagreement between witness and lock is printed as a `note` line
+(and to stderr, so it lands in the remote build log) that names both commits and ends
+"the lock governs".
+
+**2c. `repo manifest -r` can never be the reference answer — job 303324 (2026-10-03).**
+Job **303324** (`6e09b54`) FAILED in **7m58s**, before compiling anything. The Crave node
+was pre-seeded with **LOS 20**: `.repo/manifests` pointed at
+`https://github.com/accupara/los20.git` instead of `https://github.com/BlissRoms-x86/manifest.git`,
+and `resync.sh` failed to re-point it (`remote origin does not have refs/heads/master`)
+yet still reported `All repositories synchronized successfully.`, so only the 137 genuinely
+absent projects were synced and **1038 of 1175** lock paths were left at LOS 20 revisions.
+
+The mandatory canonical gate caught it, which is the point of that gate existing:
+
+```
+[FAIL] 8 locked project(s) are absent from the synced tree: external/adt-infra, tools/adt/idea,
+       tools/base, tools/build, tools/idea, tools/motodev, tools/studio/cloud, tools/swt
+[FAIL] 190 SHA-pinned project(s) are not at their locked revision: art (lock d898a1fed5f5,
+       tree aeeafbd45929), bionic (lock 145acec53cc3, tree e0aac7df6f58), ... cts
+LOCK VERIFICATION FAILED (2 problem(s), verdict=witness-mismatch, exit=1)
+FATAL: the synced tree does not match the committed X1 lock - stopping before the build
+```
+
+One screen **above** that, the revision audit on the *same witness file* printed:
+
+```
+OK all 1175 active projects on disk at their locked revisions (1175/1175 resolved via repo manifest -r)
+```
+
+It was agreeing with itself. `repo manifest -r` reports the revision each project is
+**checked out at** — it is a reading of the tree, not of the lock — so comparing on-disk
+`HEAD` against it compares disk with disk. The code even asserted the reason in a comment:
+*"repo resolved this pin; its answer is the lock's answer, by construction."* That is
+false, and it could not have failed on any tree. (`art` is the proof: the lock pins SHA
+`d898a1fed5f5`, and the witness reported `aeeafbd45929` — a SHA pin echoed back as
+anything other than itself would mean `-r` were printing the manifest rather than the tree.)
+
+The audit now takes `want` from the lock and only from the lock: a 40-hex pin is compared
+directly, a tag pin is resolved in the project that pins it, and a pin that resolves
+nowhere is an unproven pin and fails closed. The witness is consulted only afterwards, to
+count agreements, count disagreements, and report which lock paths the tree never
+mentioned — a disagreement is surfaced, never allowed to rescue a project, because letting
+it do that would just move the tautology one level down. Scenario 9 of
+`test-revision-audit.sh` is the regression test, and against the pre-fix recipe it
+reproduces 303324 in miniature: a drifted tree plus a witness that faithfully reports the
+drift yields `OK all 6 active projects ... (6/6 resolved via repo manifest -r)`.
+
+Lesson worth keeping separate from the code: **two checks that disagree are a bug in one
+of them, and the one that is *structurally incapable* of failing is the suspect.** The
+gate and the audit read the same witness and reached opposite verdicts, and the tie was
+broken not by which was more thorough but by which could have been wrong.
 
 **2b. The witness is re-resolved after the repair, not just before the first audit.**
 The post-re-sync re-audit is the last gate before `lunch`/`make`, and it was still being
@@ -330,7 +380,9 @@ regenerates the witness after any repair, so the gate describes the tree about t
 
 Offline coverage: 49 checks in `tools/manifest/test-verify-lock.py` (9 new ones for the
 witness, including all four failure modes), and 14 scenarios in
-`tools/checks/test-revision-audit.sh`. Notable ones: scenario 10 pins the *order* of the
+`tools/checks/test-revision-audit.sh`. Notable ones: scenario 9 is the 303324 regression
+(witness corroborates, never decides — proven to fail against the pre-fix recipe);
+scenario 10 pins the *order* of the
 refresh relative to the re-audit in the recipe source (that control flow needs `repo` to
 run, and a future edit that moved the refresh back after the re-audit would still pass
 `bash -n`); scenarios 12–13 drive `inspect_seed` and `manifests_clean` against synthetic
@@ -399,6 +451,64 @@ on. Nothing was pulled (pull only runs on success), so there is still no image a
 Resubmitted 2026-10-01 as job **303004**, pinned to `ded56c9` — this fix. Verified the
 queued payload from `list --json` (`jobs_active[0].workspace.cmd` names the commit): the
 plain-text `crave list` table can show a stale payload, so JSON is the check that counts.
+
+### `status` was three lines that could not fail (fixed 2026-10-03)
+
+Diagnosing 303324 meant asking the client what it thought, and the command meant to do
+that had never worked:
+
+```bash
+( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" list | sed -n '/Your jobs/,$p' | head -8
+  bash "$CRAVE_SHIM" getlog 2>&1 | tail -25 )
+```
+
+Every part was wrong against the real client:
+
+- **The table was always empty.** The client prints `Your active jobs:` and
+  `Job History:` — never `Your jobs`. So the `sed` range matched nothing, and an empty
+  table is indistinguishable from "nothing to report". When the client cannot resolve
+  the account at all it prints *no* job table whatsoever, which is the state this
+  machine is in right now.
+- **`getlog` was not pinned.** `log`, `watch` and `pull` all pass `--jobID`; `status`
+  did not, so the client resolved against the current directory's workspace and
+  answered *"No running job found on this workspace"* — which reads exactly like a
+  dead job.
+- **It exited 0 no matter what.** Observed directly: three client errors on the wire,
+  `echo $?` = 0. A status command that cannot fail converts *"I could not look"* into
+  *"there is nothing wrong"*, which is the one confusion this runbook cannot afford.
+
+It now pins `--projectID`/`--jobID` (refusing to run at all without a job id rather
+than issuing an unpinned call), reads both real section headers, and judges each probe
+on **both** its exit status and its text — necessary because the client prints
+`Error: could not get matching git url at: C:/Users/<you>` on the same stream as its
+data while still exiting 0. It distinguishes three things that used to look alike: the
+job is in the active table, the job has left the queue, and *the client drew no table
+at all*, in which case it says the state is **UNKNOWN** rather than guessing.
+
+Verified live against job 303324 — it now fetches that job's pinned log and **exits 1**
+with `client error: could not get matching git url` and the `UNKNOWN` state, where the
+old version printed an empty table and exited 0. Pinned offline by
+`tools/checks/test-crave-remote-build.sh` (15 assertions against a stub client that
+records the argv it was called with), which is red against the previous version.
+
+`run` is now the only subcommand that requires `origin/$branch` to be reachable, since
+it is the only one that launches anything; refusing to report the status of a job that
+already ran, because this checkout's origin is unreachable, is the wrong trade — and
+scoping it is also what lets the offline suite drive the read-only commands without a
+network.
+
+## Executed 2026-10-03: job 303324 ran and FAILED (foreign-base seed, and an audit that could not fail)
+
+Job **303324** (`6e09b54`, the merge of PR #6) FAILED in **7m58s**, before compiling.
+The fail-closed behaviour worked: the canonical gate refused a tree that is not the lock,
+so no wrong artifact was produced and no build time was wasted. What it exposed is
+documented in **§2c** above — a foreign-base `.repo` that left 1038 of 1175 projects at
+LOS 20 revisions, and a revision audit that compared the tree against a reading of itself
+and so reported `OK all 1175 active projects ...` on the same file the gate rejected.
+The audit now judges from the lock; scenario 9 in `test-revision-audit.sh` fails against
+the pre-fix recipe. Still outstanding for the next submission: `inspect_seed` reports a
+foreign base but does not refuse it by default, so this class of node is still discovered
+by a ~8-minute job rather than by preflight.
 
 ## Executed 2026-09-30: job 302748 ran and FAILED (the pre-seeded-tree trap, now closed)
 

@@ -28,6 +28,7 @@
 #   * tools/checks/test-build-recipe.py       - the build recipe's embedded Python,
 #     its artifact discovery, and the completeness constants it shares with the lock
 #   * tools/checks/test-revision-audit.sh - the recipe's on-disk revision audit
+#   * tools/checks/test-crave-remote-build.sh  - the Crave wrapper's `status`
 #     (HEAD vs the lock) on synthetic git repos: clean, drifted, missing, moved tag
 #   * tools/manifest/test-verify-x2-provenance.py - the post-pull X2 evidence
 #     check's own contract: a stale, truncated, unrecorded or wrong-build record
@@ -287,6 +288,7 @@ run "X1 lock: verifier exit-code contract"       python3 tools/manifest/test-ver
 run "X1 lock: generator unit tests"              python3 tools/checks/test-manifest-resolver.py
 run "build recipe: offline tests"                python3 tools/checks/test-build-recipe.py
 run "build recipe: revision audit behaviour"     bash tools/checks/test-revision-audit.sh
+run "crave client wrapper: status (stub)"      bash tools/checks/test-crave-remote-build.sh
 run "PowerShell: static checks"                  python3 tools/checks/check-powershell-static.py
 run "X2 evidence: pulled record vs artifacts"     check_x2_provenance
 run "shellcheck (informational)"                 check_shellcheck
