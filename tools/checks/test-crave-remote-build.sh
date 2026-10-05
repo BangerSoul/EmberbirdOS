@@ -39,6 +39,13 @@
 # verdict - a client that cannot answer json falls back to it, and the two
 # disagreeing is reported as DISPUTED rather than resolved in favour of one.
 #
+#   Scenario 10 drives the same probe through `watch`, where it matters more: watch
+# DECIDES COMPLETION from it, so a table-only watch could see a job leave the queue
+# only by concluding it had not - and its miss counter turned that into "the client
+# answered nothing 10 times in a row" while the real outcome sat one query away.
+# watch is therefore driven one poll at a time (WATCH_ONCE=1, WATCH_INTERVAL=0)
+# against the same stub, and must never act on a state the two probes contradict.
+#
 # WHAT IS AND IS NOT TESTED
 #   The stub speaks for the client's OUTPUT contract only: which section headers it
 #   prints and what its exit status is. It cannot prove how the real client behaves
