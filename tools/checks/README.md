@@ -39,7 +39,8 @@ command.
 | X2 evidence, pulled record | `../manifest/verify-x2-provenance.py` | that `image/out/x2-provenance.json` describes the artifacts actually on disk: every recorded hash and byte count matches, no unrecorded `.iso`/`.img` is sitting beside it, and `manifest_revision` equals the committed X1 pin |
 | X2 evidence, verifier contract | `../manifest/test-verify-x2-provenance.py` | that the check above *fails* on a stale, truncated, unrecorded, traversing or wrong-build record, and that an empty artifact list is a failure rather than a vacuous pass |
 | build recipe | `test-build-recipe.py` | the recipe's two embedded Python heredocs, artifact discovery, and the completeness constants it shares with the lock |
-| revision audit | `test-revision-audit.sh` | the recipe's verification guards extracted *verbatim* by `lib-audit.sh`: `revision_audit()` (per-project tag resolution, a tag one repository has and another does not, a stubbed `repo manifest -r` witness and its absence), `sanitize_worktrees()`, `resolve_witness()` (refresh ordering + a stubbed `repo`), and the preflight pair `inspect_seed()` / `manifests_clean()` against synthetic `.repo` trees |
+| revision audit | `test-revision-audit.sh` | the recipe's verification guards extracted *verbatim* by `lib-audit.sh`: `revision_audit()` (per-project tag resolution, a tag one repository has and another does not, and the 303324 regression — a `repo manifest -r` witness corroborates the verdict and can never produce it), `sanitize_worktrees()`, `resolve_witness()` (refresh ordering + a stubbed `repo`), and the preflight pair `inspect_seed()` / `manifests_clean()` against synthetic `.repo` trees |
+| crave wrapper | `test-crave-remote-build.sh` | `run-remote-build.sh`'s `status`, `log`, `watch` and `pull`, driven end-to-end against a **stub** client on `CRAVE_SHIM` that records the argv it was called with: that every client call is pinned (`getlog --projectID/--jobID`, `pull --projectID/--job`, `list --jobID`), that the real section headers (`Your active jobs:` / `Job History:`) are parsed and other tables are not, that "left the queue" is distinguished from "the client drew no table", that a client `Error:` line or nonzero exit makes the command exit nonzero, that all four refuse to run without a job id (and make no client call at all), that `pull` clears the ticket's staging dir first so a previous job's artifacts can never be copied and verified as this job's, and that the machine-readable `list --jobID <id> --json` record is read as the primary answer (status, exit code, start/end and the duration between them, job url) with the human tables kept as fallback and as corroboration — a json document arriving behind the client's `Error:` line is still read out *and* still fails closed, unparseable json costs nothing, and the two probes disagreeing about whether the job exists is reported as DISPUTED rather than resolved in favour of one. `watch` is driven one poll at a time (`WATCH_ONCE=1`, `WATCH_INTERVAL=0`) against the same stub: that it decides completion from the json record — a job the record calls active is never treated as finished, however empty the tables are — that a disputed state is never acted on in either direction, that a record with no such job is waited on rather than called a completion, that genuine silence is still bounded, and that the success path still captures the log and pulls |
 | fixture git | `lib-fixtures.sh` + `git-shim.sh` | whether this environment's git can record a revision at all; when it cannot, the shim stands in so the audit still runs against real revisions instead of a field of unborn HEADs |
 | PowerShell, static | `check-powershell-static.py` | ASCII purity, delimiter pairing, no dangling refs to removed symbols, and the launcher's deliberate `-DryRun` fast path |
 | shellcheck | `run-offline-checks.sh` | every shell script, when shellcheck is installed (informational: it is neither pinned nor installed project-wide, so it never reds a run) |
@@ -58,7 +59,10 @@ cannot be mistaken for one:
 * **QEMU boot and the X3-X5 evidence** need a WHPX-provisioned Windows host.
 * **`repo` itself** is not available here. The revision audit is exercised with a
   *stubbed* `repo manifest -r` (and its absence), so what is pinned is the audit's
-  decision logic -- not that a real `repo` emits the XML the recipe expects.
+  decision logic -- not that a real `repo` emits the XML the recipe expects. Note that
+  the stub can only tell you how the audit *treats* a witness: the finding behind job
+  303324 was that `repo manifest -r` reports what the tree already holds, so it is a
+  corroborating reading and never the yardstick. The stub is faithful to that contract.
 * **A real pulled image.** Until a Crave job has actually succeeded and
   `image/out/x2-provenance.json` exists, `verify-x2-provenance.py` exits **2** and the
   suite reports a `skip`. That is not a pass: it is how "there is no image yet" stays
@@ -104,9 +108,49 @@ git show HEAD~1:tools/guest-build/build-from-manifest.sh > /tmp/old.sh
 EMBERBIRD_RECIPE=/tmp/old.sh bash tools/checks/test-revision-audit.sh   # must FAIL
 ```
 
+The Crave wrapper's test honours the same idea under a different name,
+`EMBERBIRD_CRAVE_RUNNER`, because it drives the script itself rather than extracted
+fragments of it:
+
+```bash
+# write the control INSIDE the tree: the script derives REPO_ROOT from its own
+# location and reads that repo's remote and HEAD before anything else, so a copy in
+# /tmp dies at 128/127 on every assertion and the control proves nothing at all.
+git show HEAD~1:tools/crave/run-remote-build.sh > tools/crave/control-runner.sh
+EMBERBIRD_CRAVE_RUNNER=tools/crave/control-runner.sh bash tools/checks/test-crave-remote-build.sh  # must FAIL
+rm tools/crave/control-runner.sh
+```
+
+One honest limit on that control: which previous revision you point at decides what it
+can prove. The revision before the `status` fix (`6e09b54`) had no `CRAVE_SHIM`
+override, so pointing the test at it makes the script call the **real** client — it
+goes red on the substantive assertions, but its exit code is then that of a real API
+round-trip rather than of the stub, so treat that control as evidence about
+*behaviour*, not exit codes. The revision after it (`51177d8`: status fixed, `log` and
+`pull` still soft) has the override, so the same control drives the stub end to end
+and goes red on the `log`/`pull` assertions for exactly the right reasons: unpinned
+fallbacks, swallowed client errors, and a stale `.iso` from a previous pull copied
+into `image/out/`. The revision before the json probe (`540c549`) is stub-drivable the
+same way and goes red on exactly the 14 assertions that scenario 9 adds: the probe is
+never issued, so its state is neither reported nor judged, and the failure is silent.
+The revision before the watch half of that probe (`babd63e`) is stub-drivable too, and
+goes red on exactly the 21 assertions scenario 10 adds while scenarios 1–9 stay green —
+which is the shape a correct control should have: the new behaviour is missing, and
+nothing else moved. Two of those 21 are the old `watch` polling a stub forever (`exit
+124` under the suite's own `timeout` bound), because it has no `WATCH_ONCE` and no
+`WATCH_MAX_MISSES`; the bound exists so this control reports red instead of hanging.
+
 Anything the previous commit was missing must go red, for the right reason, *without
 aborting the run* -- a check that crashes the suite instead of reporting a failure hides
 the state of every scenario after it, which is the one thing this suite exists to prevent.
+
+This is how the 303324 regression test was validated rather than merely written. The
+pre-fix recipe, pointed at by `EMBERBIRD_RECIPE`, reports
+`OK all 6 active projects ... (6/6 resolved via repo manifest -r)` over a tree with a
+deliberately drifted project -- the same shape as the `OK all 1175 active projects ...
+(1175/1175 resolved via repo manifest -r)` that job 303324 printed over a tree with 190
+drifted projects. A regression test that passes against the code it was written to fix is
+decorative; this one was confirmed to fail against that code first.
 
 ## Rules for adding a check here
 
