@@ -27,8 +27,12 @@
 # `status`, `log` and `pull` are all PINNED to a job id ($JOB, else the record `run`
 # wrote to image/out/crave-job.txt) and all EXIT NONZERO when the client cannot answer
 # or answers with an error on its data stream: "I could not look" must never print as
-# "nothing is wrong". See the status block below and docs/M2-CRAVE-BUILD.md for the
-# failure history that forced each of these.
+# "nothing is wrong". `status` additionally reads the client's machine-readable
+# `crave list --jobID <id> --json` record - status, exit code and timings - and keeps
+# the human tables as its fallback and corroboration, because the tables stopped being
+# drawn for a whole day (job 303483) while the same client kept answering json. See the
+# status block below and docs/M2-CRAVE-BUILD.md for the failure history that forced
+# each of these.
 #
 # `watch` exists because a free-queue job can sit `queued` for a long time waiting for a
 # build node (observed 2026-09-24 on linux16 - the free queue costs no tokens, it is just
@@ -342,7 +346,7 @@ case "$cmd" in
       list_rc=$?; rc=1
     fi
     if printf '%s\n' "$list_out" | grep -qE '^(Error|FATAL):'; then
-      printf '  client error: %s\n' "$(printf '%s\n' "$list_out" | grep -m1 -E '^(Error|FATAL):')"
+      printf '  client error: `crave list` printed: %s\n' "$(printf '%s\n' "$list_out" | grep -m1 -E '^(Error|FATAL):')"
       rc=1
     fi
     if [ "$list_rc" -ne 0 ]; then
@@ -360,20 +364,143 @@ case "$cmd" in
     # `cut -f2-` drops the field the prefix belongs to, silently deleting "queue:".
     row_sec="${row%%$'\t'*}"
     row_txt="${row#*$'\t'}"
-    case "$row_sec" in
-      active)
-        printf '  queue:    %s\n' "$row_txt" ;;
-      history)
-        printf '  queue:    finished - %s\n' "$row_txt" ;;
-      '')
-        # "not in either table" and "the client never drew one" are different facts
-        # and must not be reported the same way.
-        if printf '%s\n' "$list_out" | grep -qE '^(Your active jobs:|Job History:)'; then
-          printf '  queue:    job %s is in neither table - it has left the queue\n' "$j"
-        else
-          printf '  queue:    the client returned NO job table at all (it answered with projects/platforms only) - the state of job %s is UNKNOWN\n' "$j"
-        fi ;;
+    # ---- job state, machine-readable, PINNED to the job (asked of every status) ----
+    # WHY THIS PROBE EXISTS (observed 2026-10-05, job 303483 - 2h18m, exit 130, no
+    # stdout retained by the platform): the client's human tables stopped being drawn
+    # for this account COMPLETELY. `list` answered with "Configured Projects:" /
+    # "Configured Platforms:" only, across ~10 calls over hours, while the job had in
+    # fact left the queue - so the table parse above could only ever report UNKNOWN.
+    # The same client answers
+    #     crave list --jobID <id> --json
+    # with the full record (status, exit code, start/end), which is how the job's real
+    # outcome was recovered. It is therefore parsed here on every status, and the table
+    # verdict above is kept as the fallback and the corroboration - so a client that
+    # cannot answer json still behaves exactly as it did, and a disagreement between
+    # the two is printed instead of silently resolved.
+    json_located=0; json_absent=0; json_sec=""; json_state=""
+    json_rc=0
+    if json_out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" list --jobID "$j" --json 2>&1 | tr -d '\r' )"; then
+      :
+    else
+      json_rc=$?; rc=1
+    fi
+    if [ "$json_rc" -ne 0 ]; then
+      printf '  client error: `crave list --jobID %s --json` exited %s\n' "$j" "$json_rc"
+    fi
+    # Judged on TEXT as well as exit status, because this client prints its
+    # diagnostics on the data stream and exits 0: verified 2026-10-05, where the json
+    # behind "Error: could not get matching git url ..." was complete and correct. So
+    # the state below is still parsed and printed - it is the most useful thing on
+    # screen - but the command exits nonzero, because "answered with a diagnostic
+    # attached" is not the same claim as "answered".
+    if printf '%s\n' "$json_out" | grep -qE '^(Error|FATAL):'; then
+      printf '  client error: `crave list --jobID %s --json` printed: %s\n' \
+             "$j" "$(printf '%s\n' "$json_out" | grep -m1 -E '^(Error|FATAL):')"
+      rc=1
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+      # The client interleaves its error line with the json, so the document is decoded
+      # from the first "{" rather than from offset 0. Fields come back tab separated:
+      # <section> <status> <exitCode> <start> <end> <duration> <job_url> <project_name>
+      json_state="$( printf '%s' "$json_out" | python3 -c '
+import json, sys
+from datetime import datetime
+raw = sys.stdin.read()
+want = sys.argv[1].strip()
+i = raw.find("{")
+if i < 0:
+    sys.exit(0)
+try:
+    data, _ = json.JSONDecoder().raw_decode(raw[i:])
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+def stamp(v):
+    for f in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(str(v), f)
+        except Exception:
+            pass
+    return None
+for section, key in (("active", "jobs_active"), ("history", "jobs_history")):
+    for rec in (data.get(key) or []):
+        if str(rec.get("jobId", "")).strip() != want:
+            continue
+        st = str(rec.get("status", "") or "")
+        ec = "" if rec.get("exitCode") is None else str(rec.get("exitCode"))
+        started = str(rec.get("startTime", "") or "")
+        ended = str(rec.get("endTime", "") or "")
+        dur = ""
+        a, b = stamp(started), stamp(ended)
+        if a and b:
+            secs = int((b - a).total_seconds())
+            if secs >= 0:
+                dur = "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+        print("\t".join([section, st, ec, started, ended, dur,
+                         str(rec.get("job_url", "") or ""),
+                         str(rec.get("project_name", "") or "")]))
+        sys.exit(0)
+print("absent")
+' "$j" 2>/dev/null || true )"
+    fi
+    case "$json_state" in
+      active$'\t'*)  json_located=1; json_sec=active ;;
+      history$'\t'*) json_located=1; json_sec=history ;;
+      absent)        json_absent=1 ;;
     esac
+
+    if [ "$json_located" = 1 ]; then
+      j_rest="${json_state#*$'\t'}"
+      j_status="${j_rest%%$'\t'*}"; j_rest="${j_rest#*$'\t'}"
+      j_exit="${j_rest%%$'\t'*}";   j_rest="${j_rest#*$'\t'}"
+      j_start="${j_rest%%$'\t'*}";  j_rest="${j_rest#*$'\t'}"
+      j_end="${j_rest%%$'\t'*}";    j_rest="${j_rest#*$'\t'}"
+      j_dur="${j_rest%%$'\t'*}";    j_rest="${j_rest#*$'\t'}"
+      j_url="${j_rest%%$'\t'*}";    j_proj="${j_rest#*$'\t'}"
+      if [ "$json_sec" = active ]; then
+        printf '  queue:    %s is ACTIVE - status %s%s (from `crave list --jobID %s --json`)\n' \
+               "$j" "'$j_status'" "${j_proj:+ in $j_proj}" "$j"
+      else
+        printf '  queue:    finished - %s status %s%s%s%s%s (from `crave list --jobID %s --json`)\n' \
+               "$j" "'$j_status'" \
+               "${j_exit:+, exit code $j_exit}" \
+               "${j_start:+, $j_start -> $j_end}" \
+               "${j_dur:+ ($j_dur)}" \
+               "${j_proj:+ in $j_proj}" "$j"
+      fi
+      if [ -n "$j_url" ]; then
+        printf '  job url:   %s\n' "$j_url"
+      fi
+      case "$row_sec" in
+        active|history)
+          printf '  table:    the human table lists this job too: %s\n' "$row_txt" ;;
+        *)
+          printf '  table:    the client drew no job table for this id this time - the json answer stands alone\n' ;;
+      esac
+    else
+      case "$row_sec" in
+        active)
+          printf '  queue:    %s\n' "$row_txt" ;;
+        history)
+          printf '  queue:    finished - %s\n' "$row_txt" ;;
+        '')
+          # "not in either table" and "the client never drew one" are different facts
+          # and must not be reported the same way.
+          if printf '%s\n' "$list_out" | grep -qE '^(Your active jobs:|Job History:)'; then
+            printf '  queue:    job %s is in neither table - it has left the queue\n' "$j"
+          else
+            printf '  queue:    the client returned NO job table at all (it answered with projects/platforms only) - the state of job %s is UNKNOWN\n' "$j"
+          fi ;;
+      esac
+      # The two probes disagreed about whether the job exists at all. Neither wins:
+      # the state is reported as disputed and the command fails, because picking the
+      # convenient answer here is how a dead job gets reported as healthy.
+      if [ "$json_absent" = 1 ] && [ -n "$row_sec" ]; then
+        printf '  note:      the json answer contains no such job but a table row does - the state is DISPUTED, treat it as unknown\n'
+        rc=1
+      fi
+    fi
 
     # ---- log tail, PINNED to the job ----
     if log_out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" getlog --projectID "$CRAVE_PROJECT_ID" --jobID "$j" 2>&1 | tr -d '\r' )"; then

@@ -502,7 +502,7 @@ now also clears the ticket's `eb/image/out/` before fetching: the copy + verify 
 below it would otherwise hash whatever the PREVIOUS pull left in the ticket and
 present it as this job's record — the artifact-level version of the self-witnessing
 that §2c documents for the audit. The stub client gained a `pull` mode and the same
-test file now pins all three subcommands (33 assertions); pointed at the pre-fix
+test file now pins all three subcommands (38 assertions at that point); pointed at the pre-fix
 revision, the new assertions go red — including one that catches the old `pull`
 copying a stale `.iso` from a previous job into `image/out/`, where the X2 verifier
 then has to reject the whole record.
@@ -512,6 +512,45 @@ it is the only one that launches anything; refusing to report the status of a jo
 already ran, because this checkout's origin is unreachable, is the wrong trade — and
 scoping it is also what lets the offline suite drive the read-only commands without a
 network.
+
+### `status` had one blind spot left: the tables can vanish entirely (fixed 2026-10-05)
+
+Job 303483 exposed it. Its human job tables — `Your active jobs:` and `Job History:` —
+stopped being drawn for this account altogether: `crave list` answered with *Configured
+Projects* / *Configured Platforms* only, hour after hour, across roughly ten calls, while
+the job had in fact left the queue. The parse could only report that as **UNKNOWN**. That
+is honest, and useless: the state had to be recovered by hand-probing the client.
+
+The same client answers a machine-readable form of the same question:
+
+```bash
+bash tools/crave/crave.sh list --jobID 303483 --json
+```
+
+which returns `jobs_active` / `jobs_history` carrying the job's `status`, `exitCode`,
+`startTime`, `endTime` and `job_url` — facts the human tables never had. `status` now asks
+for that FIRST, pinned to the job id, and keeps the tables as its fallback and as
+corroboration:
+
+- json locates the job → the state is reported from it (status, exit code, start → end and
+  the duration between them, the job url), and the table verdict is printed alongside, as
+  corroboration or as *"the client drew no job table for this id this time"*;
+- json cannot be parsed, or parses without our job → the table verdict stands exactly as
+  before;
+- the two **disagree** about whether the job exists → the report says **DISPUTED** and the
+  command exits nonzero. Neither probe wins by default: quietly preferring the convenient
+  answer is how a dead job gets reported as healthy.
+
+The diagnostic-on-the-data-stream rule is unchanged and still applies to this probe —
+verified live, the json arrives *behind* `Error: could not get matching git url ...` with
+the client exiting 0. So the state behind it is still printed (it is the most useful thing
+on screen) and the command still exits 1: *"answered with a diagnostic attached"* is not
+*"answered"*. Against 303483 the same command now prints the job's real outcome —
+`finished`, `status 'done'`, `exit code 130`, `2h18m`, the job url — where the previous
+revision printed UNKNOWN. Scenario 9 of `tools/checks/test-crave-remote-build.sh` pins all
+of it (56 assertions overall, 18 of them from scenario 9); the control run against
+`540c549` goes red on 14 of those 18 — the other four assert the table fallback, which
+the previous revision already had.
 
 ## Executed 2026-10-03: job 303324 ran and FAILED (foreign-base seed, and an audit that could not fail)
 
@@ -544,6 +583,39 @@ Two things the hardening already changed about a submission:
   `Error: could not get matching git url` diagnostic, and exits 1 rather than claiming a
   clean answer — this machine's client prints that error even when it answers, and
   "answered partially" is now distinguishable from "answered".
+
+## Executed 2026-10-04: job 303483 ran and FAILED (exit 130 after 2h18m, and no telemetry left)
+
+Job **303483** (`0e89318`, PR #7) ran **2h18m** — `2026-10-04T02:29:20Z` →
+`04:47:38Z` — and finished with **exit code 130**. Its state was recovered on 2026-10-05
+from `crave list --jobID 303483 --json`, because by then even the log was unreachable.
+
+What the job did prove:
+
+- **The pinning chain worked.** The recipe fetched the pinned commit `0e89318` and ran
+  `build-from-manifest.sh` — the recipe text is in the job's own workspace record, and the
+  job outlived every way of reading it back.
+- **It is NOT the foreign-base seed failure class.** 303324 died in 7m58s during
+  preflight; this one ran for over two hours, so it got well past preflight into the
+  multi-hour sync/build phase. The `inspect_seed` gap is still real, but it did not end
+  this job.
+
+What could not be established:
+
+- **The platform kept nothing.** `getlog` answers *"Could not find job stdout"*,
+  `fetchdiagnostics` answers *"System logs for job 303483 not available"*, and `pull`
+  refuses with *"no running jobs on this workspace"* — so exit code 130, an
+  interrupt-class exit, cannot be attributed from the client. Node reclaim, a platform
+  kill and a guest-side interrupt all look identical from here. The web build page
+  (`https://foss.crave.io/app/#/build/info/303483?team=14`) is the only place the full log
+  may still exist.
+- Therefore **PR #7 was not merged**: its own dogfood run did not succeed, and this
+  runbook does not merge on a build that did not pass. The PR body records the outcome.
+
+The wrapper behaved as designed throughout — `status` reported UNKNOWN instead of
+guessing while the tables were blind, `pull` failed closed naming the probe instead of
+reporting an empty transfer as success — and the json probe added afterwards is what makes
+this state recoverable without hand-probing the client.
 
 ## Executed 2026-09-30: job 302748 ran and FAILED (the pre-seeded-tree trap, now closed)
 

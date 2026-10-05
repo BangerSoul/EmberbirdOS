@@ -30,6 +30,15 @@
 #   first, so a failed pull can no longer leave the PREVIOUS job's artifacts in
 #   place for the copy + verify steps to bless as this job's record.
 #
+#   2026-10-05 added the probe that made a status answerable at all: the client's
+# human tables stopped being drawn for this account for hours (job 303483 finished,
+# exit 130, with no stdout retained), and only `list --jobID <id> --json` kept
+# answering. Scenario 9 drives that probe: it must carry status, exit code and
+# timings on its own, it must still exit nonzero when the client's diagnostic rides
+# the same stream (the state is printed anyway), and it must never cost the table
+# verdict - a client that cannot answer json falls back to it, and the two
+# disagreeing is reported as DISPUTED rather than resolved in favour of one.
+#
 # WHAT IS AND IS NOT TESTED
 #   The stub speaks for the client's OUTPUT contract only: which section headers it
 #   prints and what its exit status is. It cannot prove how the real client behaves
@@ -69,13 +78,21 @@ STUB="$T/crave-stub"
 cat > "$STUB" <<'STUB'
 #!/usr/bin/env bash
 # A stand-in for tools/crave/crave.sh. Behaviour is driven by STUB_LIST_BODY,
-# STUB_LIST_RC, STUB_LOG_BODY, STUB_LOG_RC and the STUB_PULL_* set. Every
-# invocation appends its argv to STUB_ARGV so a test can prove which flags the
-# script actually passed.
+# STUB_LIST_RC, STUB_LIST_JSON_BODY, STUB_LIST_JSON_RC, STUB_LOG_BODY, STUB_LOG_RC and
+# the STUB_PULL_* set. Every invocation appends its argv to STUB_ARGV so a test can
+# prove which flags the script actually passed.
 printf '%s\n' "$*" >> "${STUB_ARGV:?}"
 sub="$1"; shift
 case "$sub" in
   list)
+    # The real client answers `list --jobID <id> --json` with a machine-readable job
+    # record instead of the human tables (that probe is how job 303483's real outcome
+    # was recovered on 2026-10-05), so the stub has to answer both shapes.
+    case " $* " in
+      *' --json '*)
+        printf '%s' "${STUB_LIST_JSON_BODY:-}"
+        exit "${STUB_LIST_JSON_RC:-0}" ;;
+    esac
     printf '%s' "${STUB_LIST_BODY:-}"
     exit "${STUB_LIST_RC:-0}" ;;
   getlog)
@@ -165,6 +182,16 @@ NO_TABLE='Configured Projects:
 
 79  CipherOS  https://github.com/CipherOS/android_manifest.git  Complete
 '
+# The json shape, copied from the real client (job 303483): `list --jobID <id> --json`
+# returns every job list as an array, so a finished job appears in "jobs_history" with
+# its status, exit code and timings - facts the human tables never carried.
+JSON_ACTIVE='{"projects":[],"jobs_active":[{"jobId":777777,"project_name":"LOS 20","status":"running"}],"jobs_history":[],"platforms":[]}'
+JSON_FINISHED='{"projects":[],"jobs_active":[],"jobs_history":[{"jobId":777777,"project_name":"LOS 20","status":"done","exitCode":130,"startTime":"2026-10-04T02:29:20.179Z","endTime":"2026-10-04T04:47:38.257Z","job_url":"https://foss.crave.io/app/#/build/info/777777?team=14"}],"platforms":[]}'
+JSON_ABSENT='{"projects":[],"jobs_active":[],"jobs_history":[],"platforms":[]}'
+# What the client really did on 2026-10-05: its diagnostic on the data stream, exit 0,
+# and a complete json document behind it.
+JSON_FINISHED_WITH_ERROR="Error: could not get matching git url at: C:/Users/someone
+$JSON_FINISHED"
 export STUB_ARGV="$T/argv.txt"
 export STUB_LOG_BODY='Build Failed: returned 1
 Total time: 7m58s
@@ -438,6 +465,106 @@ if [ ! -e "$FAKE2/image/out/old-build.iso" ]; then
 else
   bad "a stale .iso was copied into image/out"
 fi
+
+echo "-- 9. status reads the client's json record (the probe that recovered job 303483)"
+# The tables are drawn NOTHING here - exactly what the real client did for hours on
+# 2026-10-05 - so every answer below has to come from `list --jobID <id> --json`.
+: > "$STUB_ARGV"
+STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ACTIVE" \
+  STUB_LOG_RC=0 run_status 0 "an active job is reported from the json probe alone"
+if grep -q -- '^list --jobID 777777 --json$' "$STUB_ARGV"; then
+  pass "the json probe is pinned to the job id"
+else
+  bad "the json probe was not pinned to the job"; sed 's/^/         /' "$STUB_ARGV"
+fi
+case "$STATUS_OUT" in
+  *"777777 is ACTIVE - status 'running'"*) pass "the json status is reported" ;;
+  *) bad "the json status was not reported"; printf '%s\n' "$STATUS_OUT" | sed 's/^/         /' ;;
+esac
+
+# The real finished-job record: status, exit code, timings and the job url, none of
+# which the human tables ever carried.
+STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_FINISHED" \
+  STUB_LOG_RC=0 run_status 0 "a finished job is reported from the json probe alone"
+case "$STATUS_OUT" in
+  *"finished - 777777 status 'done', exit code 130"*) pass "the json exit code is reported" ;;
+  *) bad "the json exit code was not reported"; printf '%s\n' "$STATUS_OUT" | sed 's/^/         /' ;;
+esac
+case "$STATUS_OUT" in
+  *"2h18m"*) pass "the json timings are turned into a duration" ;;
+  *) bad "the duration was not derived from startTime/endTime"; printf '%s\n' "$STATUS_OUT" | sed 's/^/         /' ;;
+esac
+case "$STATUS_OUT" in
+  *"job url:   https://foss.crave.io/app/#/build/info/777777?team=14"*) pass "the job url from the json record is shown" ;;
+  *) bad "the job url was not shown"; printf '%s\n' "$STATUS_OUT" | sed 's/^/         /' ;;
+esac
+case "$STATUS_OUT" in
+  *"no job table for this id this time"*) pass "the missing tables are named instead of driving the verdict" ;;
+  *) bad "the absent tables were not accounted for"; printf '%s\n' "$STATUS_OUT" | sed 's/^/         /' ;;
+esac
+
+# THE REGRESSION THIS FIX EXISTS FOR: the client's diagnostic rides the same stream as
+# a complete json document and it exits 0. The state must still be read out of it - and
+# the command must still exit nonzero, because that is not a clean answer.
+STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_FINISHED_WITH_ERROR" \
+  STUB_LOG_RC=0 run_status 1 "error-on-the-stream plus a real json record exits nonzero"
+case "$STATUS_OUT" in
+  *"finished - 777777 status 'done', exit code 130"*) pass "the state is still read out of the json behind the error" ;;
+  *) bad "the json behind the client error was discarded"; printf '%s\n' "$STATUS_OUT" | sed 's/^/         /' ;;
+esac
+case "$STATUS_OUT" in
+  *"could not get matching git url"*) pass "the client's own diagnostic is still surfaced" ;;
+  *) bad "the client diagnostic was swallowed"; printf '%s\n' "$STATUS_OUT" | sed 's/^/         /' ;;
+esac
+
+# A json probe that fails outright fails closed, naming the probe.
+out="$( cd "$TICKET" && JOB=777777 TICKET_DIR="$TICKET" CRAVE_SHIM="$STUB" \
+        STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY='' STUB_LIST_JSON_RC=4 \
+        STUB_LOG_RC=0 bash "$SCRIPT" status 2>&1 )" && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then pass "a failing json probe exits nonzero (rc=$rc)"; else bad "a failing json probe still exited 0"; fi
+case "$out" in
+  *'crave list --jobID 777777 --json` exited 4'*) pass "the failing json probe is named with its exit code" ;;
+  *) bad "the failing json probe was not named"; printf '%s\n' "$out" | sed 's/^/         /' ;;
+esac
+
+# Garbage instead of json must not swallow the tables: the human verdict still stands.
+out="$( cd "$TICKET" && JOB=777777 TICKET_DIR="$TICKET" CRAVE_SHIM="$STUB" \
+        STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY='not json at all
+' STUB_LIST_JSON_RC=0 STUB_LOG_RC=0 bash "$SCRIPT" status 2>&1 )" && rc=0 || rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q '777777  LOS 20        running'; then
+  pass "unparseable json falls back to the table verdict"
+else
+  bad "an unparseable json answer cost us the table verdict (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/         /'
+fi
+
+# The two probes disagreeing about whether the job exists is not resolved by picking
+# one: it is reported and the command fails.
+out="$( cd "$TICKET" && JOB=777777 TICKET_DIR="$TICKET" CRAVE_SHIM="$STUB" \
+        STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ABSENT" \
+        STUB_LIST_JSON_RC=0 STUB_LOG_RC=0 bash "$SCRIPT" status 2>&1 )" && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "json saying 'no such job' against a table that has it exits nonzero (rc=$rc)"
+else
+  bad "the disagreement between the two probes was silently resolved"
+fi
+case "$out" in
+  *"DISPUTED"*) pass "the disagreement is named in the report" ;;
+  *) bad "the disagreement was not surfaced"; printf '%s\n' "$out" | sed 's/^/         /' ;;
+esac
+
+# Both probes answering is the healthy case: the table corroborates the json.
+out="$( cd "$TICKET" && JOB=777777 TICKET_DIR="$TICKET" CRAVE_SHIM="$STUB" \
+        STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ACTIVE" \
+        STUB_LIST_JSON_RC=0 STUB_LOG_RC=0 bash "$SCRIPT" status 2>&1 )" && rc=0 || rc=$?
+if [ "$rc" = 0 ]; then
+  pass "both probes answering agrees and exits 0 (rc=0)"
+else
+  bad "agreeing probes still exited nonzero (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/         /'
+fi
+case "$out" in
+  *"the human table lists this job too"*) pass "the table is reported as corroboration" ;;
+  *) bad "the corroborating table row was not reported"; printf '%s\n' "$out" | sed 's/^/         /' ;;
+esac
 
 echo
 if [ "$fail" = 0 ]; then
