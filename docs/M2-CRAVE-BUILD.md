@@ -487,9 +487,9 @@ job is in the active table, the job has left the queue, and *the client drew no 
 at all*, in which case it says the state is **UNKNOWN** rather than guessing.
 
 Verified live against job 303324 — it now fetches that job's pinned log and **exits 1**
-with `client error: could not get matching git url` and the `UNKNOWN` state, where the
-old version printed an empty table and exited 0. Pinned offline by
-`tools/checks/test-crave-remote-build.sh` (then 15 assertions against a stub client
+with a `client error:` line naming the probe that failed and the `UNKNOWN` state, where
+the old version printed an empty table and exited 0. Pinned offline by
+`tools/checks/test-crave-remote-build.sh` (then 17 assertions against a stub client
 that records the argv it was called with), which is red against the previous version.
 
 `log` and `pull` still carried the unpinned fallbacks after that fix, so on 2026-10-04
