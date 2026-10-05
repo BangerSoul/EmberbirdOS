@@ -100,7 +100,9 @@ bash tools/crave/run-remote-build.sh log
 
 # leave a watcher running: it polls until the job reports success, then pulls the
 # artifact and the X2 record by itself (a queued job plus a multi-hour build makes
-# "check back later" the normal case, not the exception)
+# "check back later" the normal case, not the exception). `status` and `watch` both
+# read the client's machine-readable `list --jobID <id> --json` record first and keep
+# the human tables as fallback - so neither breaks when the client stops drawing them.
 bash tools/crave/run-remote-build.sh watch
 
 # pull back only the small results, into image/out/
@@ -528,8 +530,8 @@ bash tools/crave/crave.sh list --jobID 303483 --json
 ```
 
 which returns `jobs_active` / `jobs_history` carrying the job's `status`, `exitCode`,
-`startTime`, `endTime` and `job_url` — facts the human tables never had. `status` now asks
-for that FIRST, pinned to the job id, and keeps the tables as its fallback and as
+`startTime`, `endTime` and `job_url` — facts the human tables never had. Both pollers ask
+for that FIRST, pinned to the job id, and keep the tables as their fallback and as
 corroboration:
 
 - json locates the job → the state is reported from it (status, exit code, start → end and
@@ -548,9 +550,61 @@ on screen) and the command still exits 1: *"answered with a diagnostic attached"
 *"answered"*. Against 303483 the same command now prints the job's real outcome —
 `finished`, `status 'done'`, `exit code 130`, `2h18m`, the job url — where the previous
 revision printed UNKNOWN. Scenario 9 of `tools/checks/test-crave-remote-build.sh` pins all
-of it (56 assertions overall, 18 of them from scenario 9); the control run against
-`540c549` goes red on 14 of those 18 — the other four assert the table fallback, which
-the previous revision already had.
+of it (56 assertions across scenarios 1–9 at that point, 18 of them from scenario 9); the
+control run against `540c549` goes red on 14 of those 18 — the other four assert the table
+fallback, which the previous revision already had.
+
+### `watch` decided completion from the same blind spot (fixed 2026-10-05)
+
+`watch` reads the same record, and it matters more there than in `status`. `status`
+*reports*; `watch` **decides completion** from *"the job is no longer queued or
+running"*, and it read that out of the human table alone. With the tables undrawn — the
+state this account sat in for hours on 2026-10-05 — a table-only `watch` could see the
+job leave the queue only by concluding that it had **not** left, so the first poll after
+the job finished would capture the log and announce a verdict; and with no stdout
+retained by the platform (303483) that verdict is whatever the log happened to contain.
+Left alone it is worse than that: the old miss guard counted an empty poll as silence,
+so ten polls later it died with *"the client answered nothing 10 times in a row"* having
+learned nothing, while the real outcome was one query away.
+
+The probe is now a shared function (`job_state_json`), asked on **every** poll, and the
+completion decision follows the same precedence `status` uses:
+
+- json says the job is active → keep polling, whatever the tables did (this is the case
+  the old loop got backwards: an empty table meant *"finished"*);
+- json says it is done → the log is captured and decides success vs failure, and the
+  report carries the exit code and duration from the record — so a watcher that was
+  asleep through the build still reports `exit code 130 (2h18m)` rather than a bare
+  timeout;
+- json cannot be read → the table's word stands, exactly as before;
+- the two **disagree**, or json reports the job while the table still lists it → the poll
+  is reported as **DISPUTED** and `watch` keeps waiting. A disagreement is never resolved
+  into a completion in either direction: *json done / table running* must not end a build
+  that is still going, and *json running / table finished* must not end one either;
+- json has no record of the job anywhere (`absent`) and the table draws nothing → reported
+  as its own state, **unseen**, explicitly *not* a completion, and waited on. The job id
+  may be wrong, or the client may have lost the job; calling either a finished build is
+  the exact false completion this block exists to prevent.
+
+The give-up guard is kept for genuine silence and is now per-condition and bounded by
+`WATCH_MAX_MISSES` (default 10, as before): *nothing answered*, *the probes disagree*,
+and *no record of the job* each end in a message naming the condition, and none of them
+ends in a verdict. `WATCH_ONCE=1` runs a single poll and exits — 0 while the job is
+active, 1 when the poll could not name a state — which is how scenario 10 of
+`tools/checks/test-crave-remote-build.sh` drives `watch` with no queue behind it
+(`WATCH_INTERVAL=0` and the stub client). Scenario 10 adds 33 assertions (89 overall);
+the control run against `babd63e` goes red on 21 of them and on **nothing** in scenarios
+1–9, which is the point: this change must not alter what `status`/`log`/`pull` already
+do. Two of those reds are the old loop polling forever on a stub (`exit 124`, the
+suite's own `timeout` bound) because it has no `WATCH_ONCE` — that is the control
+working, not a hang.
+
+One smaller defect went with it: the old loop treated only `queued|pending|starting|
+running` as still-active, so a job the client reported as `building` or `syncing` read
+as **terminal** and had its log captured mid-build. Both words are now in the shared
+still-active list, which is also the single list the two probes are compared against —
+otherwise a naming difference (json `syncing` vs table `running`) would be reported as a
+dispute.
 
 ## Executed 2026-10-03: job 303324 ran and FAILED (foreign-base seed, and an audit that could not fail)
 

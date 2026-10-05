@@ -50,9 +50,15 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # Which revision of the script is under test. Same convention as EMBERBIRD_RECIPE in
 # lib-audit.sh: a test written alongside a fix passes trivially against that fix, so
 # point it at the previous revision and require it to go red -
-#   git show HEAD~1:tools/crave/run-remote-build.sh > /tmp/old.sh
-#   EMBERBIRD_CRAVE_RUNNER=/tmp/old.sh bash tools/checks/test-crave-remote-build.sh  # must FAIL
+#   git show HEAD~1:tools/crave/run-remote-build.sh > tools/crave/control-runner.sh
+#   EMBERBIRD_CRAVE_RUNNER=tools/crave/control-runner.sh bash tools/checks/test-crave-remote-build.sh  # must FAIL
+#   rm tools/crave/control-runner.sh
+# Write the control INSIDE the tree, not to /tmp: the script derives REPO_ROOT from its
+# own location and reads that repo's remote and HEAD before anything else, so a copy in
+# /tmp dies at 128/127 on every assertion and the control proves nothing. Absolute,
+# because every helper below runs the script from inside $TICKET.
 SCRIPT="${EMBERBIRD_CRAVE_RUNNER:-$REPO_ROOT/tools/crave/run-remote-build.sh}"
+SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")"
 # Some sandboxes refuse `git commit`, and ensure_ticket resolves the ticket's branch
 # with `rev-parse --abbrev-ref HEAD` - on a repo with no commit that prints a fatal
 # error to stderr and pollutes every assertion. lib-fixtures.sh probes for a git that
@@ -166,6 +172,27 @@ run_log() {
   fi
 }
 
+# run_watch <expected-exit> <label> [tree] - ONE poll of `watch` (WATCH_ONCE=1).
+# It runs against a COPY of the tree (default $FAKE) because a `watch` that reaches
+# completion writes image/out/crave-remote-log.txt and then pulls: driving that here
+# must not touch this repository's own image/out. STUB_* is exported by the caller.
+# The `timeout` is not decoration: against a runner that predates WATCH_ONCE (the
+# negative control below does exactly that) `watch` ignores it and polls a stub
+# forever, so without the bound this suite would hang instead of reporting red.
+run_watch() {
+  local want="$1" label="$2" tree="${3:-$FAKE}" rc=0
+  WATCH_OUT="$( cd "$TICKET" && JOB=777777 TICKET_DIR="$TICKET" CRAVE_SHIM="$STUB" \
+                  WATCH_INTERVAL=0 WATCH_ONCE=1 WATCH_MAX_MISSES=2 \
+                  timeout 20 bash "$tree/tools/crave/run-remote-build.sh" watch 2>&1 )" || rc=$?
+  WATCH_RC="$rc"
+  if [ "$rc" = "$want" ]; then
+    pass "$label (exit $rc)"
+  else
+    bad "$label: exit $rc, expected $want"
+    printf '%s\n' "$WATCH_OUT" | sed 's/^/         /'
+  fi
+}
+
 ACTIVE_TABLE='Your active jobs:
 
 Job Id  Project Name  Job Status  Local Workspace  Job Url
@@ -192,6 +219,8 @@ JSON_ABSENT='{"projects":[],"jobs_active":[],"jobs_history":[],"platforms":[]}'
 # and a complete json document behind it.
 JSON_FINISHED_WITH_ERROR="Error: could not get matching git url at: C:/Users/someone
 $JSON_FINISHED"
+# A job that really did build: the state word `watch` acts on when the log says so.
+JSON_SUCCESS='{"projects":[],"jobs_active":[],"jobs_history":[{"jobId":777777,"project_name":"LOS 20","status":"success"}],"platforms":[]}'
 export STUB_ARGV="$T/argv.txt"
 export STUB_LOG_BODY='Build Failed: returned 1
 Total time: 7m58s
@@ -565,6 +594,194 @@ case "$out" in
   *"the human table lists this job too"*) pass "the table is reported as corroboration" ;;
   *) bad "the corroborating table row was not reported"; printf '%s\n' "$out" | sed 's/^/         /' ;;
 esac
+
+echo "-- 10. watch decides completion from the json record too"
+# The same blind spot that made `status` unanswerable made `watch` dangerous, because
+# `watch` DECIDES COMPLETION from it: with the tables undrawn, a table-only watch could
+# see the job leave the queue only by concluding that it had not left, so the first
+# poll after the job finished would capture the log and report a verdict - and with no
+# stdout retained by the platform (303483) that verdict is whatever the log happened
+# to contain. Every answer below has to come from `list --jobID <id> --json`.
+: > "$STUB_ARGV"
+rm -f "$FAKE/image/out/crave-remote-log.txt"
+STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ACTIVE" \
+  STUB_LOG_BODY='compiling...
+Total time: 3m
+' run_watch 0 "a job the json calls active keeps being watched, tables or no tables"
+case "$WATCH_OUT" in
+  *"state=running [json]"*) pass "watch reads the state from the json record" ;;
+  *) bad "watch did not read the state from the json"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+if grep -q -- '^list --jobID 777777 --json$' "$STUB_ARGV"; then
+  pass "watch pins the json probe to the job id"
+else
+  bad "watch's json probe was not pinned to the job"; sed 's/^/         /' "$STUB_ARGV"
+fi
+if [ ! -e "$FAKE/image/out/crave-remote-log.txt" ] && ! grep -q '^pull' "$STUB_ARGV"; then
+  pass "a job still running is never treated as finished (no log capture, no pull)"
+else
+  bad "watch treated a running job as complete while the json said otherwise"
+  sed 's/^/         /' "$STUB_ARGV"
+fi
+
+# Both probes answering with the same word is the healthy case.
+STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ACTIVE" \
+  STUB_LOG_BODY='building...
+' run_watch 0 "an active table row and the json agree - still watching"
+
+# The real finished job: the verdict comes from the json, with the facts the tables
+# never carried, and the log (not the table) still decides success from failure.
+rm -f "$FAKE/image/out/crave-remote-log.txt"
+STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_FINISHED" \
+  STUB_LOG_BODY='Build Failed: returned 130
+' run_watch 1 "a job the json calls finished is reported as finished, not as a timeout"
+case "$WATCH_OUT" in
+  *"state=done [json]"*) pass "the terminal state comes from the json record" ;;
+  *) bad "the terminal state was not read from the json"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+case "$WATCH_OUT" in
+  *"exit code 130"*) pass "the json exit code reaches the failure report" ;;
+  *) bad "the json exit code was dropped by watch"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+case "$WATCH_OUT" in
+  *"2h18m"*) pass "the json timings reach the failure report" ;;
+  *) bad "watch did not report how long the job ran"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+if [ -s "$FAKE/image/out/crave-remote-log.txt" ]; then
+  pass "the terminal path still captures the remote log"
+else
+  bad "no log was captured for a finished job"
+fi
+
+# The client's diagnostic on the data stream must not cost the state, and must not be
+# mistaken for silence either - the record behind it is complete.
+STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_FINISHED_WITH_ERROR" \
+  STUB_LOG_BODY='Build Failed: returned 130
+' run_watch 1 "error-on-the-stream plus a real json record still ends the watch correctly"
+case "$WATCH_OUT" in
+  *"state=done [json]"*) pass "the state is still read out of the json behind the error" ;;
+  *) bad "the json behind the client error was discarded by watch"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+case "$WATCH_OUT" in
+  *"could not get matching git url"*) pass "the client's own diagnostic is surfaced by watch" ;;
+  *) bad "watch swallowed the client diagnostic"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+
+# A json probe that cannot be read costs nothing: the table verdict stands, exactly
+# as it did before this probe existed.
+STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY='not json at all
+' STUB_LIST_JSON_RC=0 STUB_LOG_BODY='building...
+' run_watch 0 "an unparseable json answer falls back to the table verdict"
+case "$WATCH_OUT" in
+  *"state=running [table]"*) pass "watch says which probe it believed" ;;
+  *) bad "the fallback was not taken (or not reported)"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+
+# THE DIRECTION THAT MATTERS MOST: the two probes disagree, and neither may be
+# resolved into a completion. json says it is done, the table still says running -
+# the table-only loop would have read "running" and polled forever, but resolving the
+# other way would declare a running build finished. So watch reports and waits.
+: > "$STUB_ARGV"
+rm -f "$FAKE/image/out/crave-remote-log.txt"
+STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_FINISHED" \
+  STUB_LOG_BODY='compiling...
+' run_watch 1 "json says finished, the table says running -> disputed, not completed"
+case "$WATCH_OUT" in
+  *"DISPUTED"*) pass "the disagreement is named" ;;
+  *) bad "the disagreement was not surfaced"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+if [ ! -e "$FAKE/image/out/crave-remote-log.txt" ] && ! grep -q '^pull' "$STUB_ARGV"; then
+  pass "a disputed state is never acted on (no capture, no pull)"
+else
+  bad "watch acted on a state the probes contradict"
+fi
+# And the mirror image, which is the false-completion trap: json says running while
+# the table has already dropped it into Job History.
+STUB_LIST_BODY="$HISTORY_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ACTIVE" \
+  STUB_LOG_BODY='compiling...
+' run_watch 1 "json says running, the table says finished -> disputed, not completed"
+if [ ! -e "$FAKE/image/out/crave-remote-log.txt" ]; then
+  pass "watch kept watching a job the history table had finished"
+else
+  bad "watch accepted the history table's 'finished' over the json's 'running'"
+fi
+
+# json saying "no such job" against a table that still lists it is a disagreement too.
+: > "$STUB_ARGV"
+STUB_LIST_BODY="$ACTIVE_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ABSENT" \
+  STUB_LIST_JSON_RC=0 STUB_LOG_BODY='compiling...
+' run_watch 1 "json saying 'no such job' against a table that has it -> disputed"
+case "$WATCH_OUT" in
+  *"DISPUTED"*) pass "the missing-job disagreement is named, not silently resolved" ;;
+  *) bad "the disagreement was not surfaced"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+
+# "No record of this job anywhere" is neither silence nor a completion: waiting is the
+# only safe answer, and it is bounded rather than endless.
+: > "$STUB_ARGV"
+STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_ABSENT" \
+  STUB_LIST_JSON_RC=0 STUB_LOG_BODY='' run_watch 1 "a job the client has no record of is waited on, then reported"
+case "$WATCH_OUT" in
+  *"state=unseen"*) pass "the absent-record case is its own state, not 'finished'" ;;
+  *) bad "an absent record was reported as a completion"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+case "$WATCH_OUT" in
+  *"no record of job 777777"*) pass "the absent-record case names the job it is about" ;;
+  *) bad "the absent-record report does not name the job"; printf '%s\n' "$WATCH_OUT" | sed 's/^/         /' ;;
+esac
+if ! grep -q '^pull' "$STUB_ARGV"; then
+  pass "an absent record never triggers a pull"
+else
+  bad "watch pulled on the strength of an absent record"
+fi
+
+# Genuine silence still gives up - the guard the json probe does not replace, because
+# a client that answers nothing is a different failure from one that answers wrongly.
+# Driven without WATCH_ONCE (the counter needs a second poll to reach its bound),
+# with WATCH_MAX_MISSES=2 and no sleep, so it costs milliseconds.
+out="$( cd "$TICKET" && JOB=777777 TICKET_DIR="$TICKET" CRAVE_SHIM="$STUB" \
+        WATCH_INTERVAL=0 WATCH_MAX_MISSES=2 \
+        STUB_LIST_BODY='' STUB_LIST_RC=0 STUB_LIST_JSON_BODY='' STUB_LIST_JSON_RC=0 \
+        STUB_LOG_BODY='' timeout 20 bash "$FAKE/tools/crave/run-remote-build.sh" watch 2>&1 )" && rc=0 || rc=$?
+if [ "$rc" -ne 0 ]; then pass "a client that answers nothing is still bounded (rc=$rc)"; else bad "silence was not bounded"; fi
+case "$out" in
+  *"answered nothing 2 times in a row"*) pass "the give-up guard still fires on real silence, naming the bound it reached" ;;
+  *) bad "silence was not bounded (or the bound was not named)"; printf '%s\n' "$out" | sed 's/^/         /' ;;
+esac
+case "$out" in
+  *"state=unknown"*) pass "an unanswered poll reports unknown, never finished" ;;
+  *) bad "silence was reported as something else"; printf '%s\n' "$out" | sed 's/^/         /' ;;
+esac
+
+# And the happy path, end to end: a successful job captured and pulled, exactly as
+# before - run against the pull fixture so the artifacts land in FAKE2.
+: > "$STUB_ARGV"
+rm -f "$FAKE2/image/out/crave-remote-log.txt"
+mkdir -p "$TICKET/eb/image/out"
+out="$( cd "$TICKET" && JOB=777777 TICKET_DIR="$TICKET" CRAVE_SHIM="$STUB" \
+        WATCH_INTERVAL=0 WATCH_ONCE=1 WATCH_MAX_MISSES=2 \
+        STUB_LIST_BODY="$NO_TABLE" STUB_LIST_RC=0 STUB_LIST_JSON_BODY="$JSON_SUCCESS" \
+        STUB_LOG_BODY='[100%] Build Successful
+' STUB_PULL_DIR="$TICKET/eb/image/out" STUB_PULL_RECORD=1 STUB_PULL_REVISION="$FIXREV" \
+        timeout 20 bash "$FAKE2/tools/crave/run-remote-build.sh" watch 2>&1 )" && rc=0 || rc=$?
+if [ "$rc" = 0 ]; then
+  pass "a successful job is captured and pulled (exit 0)"
+else
+  bad "the watch happy path failed (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/         /'
+fi
+case "$out" in
+  *"state=success [json]"*) pass "watch saw the success in the json record, not the table" ;;
+  *) bad "watch did not read the success state from the json"; printf '%s\n' "$out" | sed 's/^/         /' ;;
+esac
+case "$out" in
+  *"Build Successful"*) pass "the log really was captured before the pull" ;;
+  *) bad "the log capture step did not run"; printf '%s\n' "$out" | sed 's/^/         /' ;;
+esac
+if grep -q -- '--job 777777' "$STUB_ARGV" && [ -f "$FAKE2/image/out/x2-provenance.json" ]; then
+  pass "the artifact and its X2 record landed in the repo, from a pinned pull"
+else
+  bad "watch's pull was unpinned or never ran"; sed 's/^/         /' "$STUB_ARGV"
+fi
 
 echo
 if [ "$fail" = 0 ]; then

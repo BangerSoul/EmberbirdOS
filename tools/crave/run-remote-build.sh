@@ -24,15 +24,18 @@
 #   bash tools/crave/run-remote-build.sh pull     # fetch image/out/* back into this repo
 #   bash tools/crave/run-remote-build.sh stop     # stop the job on this workspace
 #
-# `status`, `log` and `pull` are all PINNED to a job id ($JOB, else the record `run`
-# wrote to image/out/crave-job.txt) and all EXIT NONZERO when the client cannot answer
-# or answers with an error on its data stream: "I could not look" must never print as
-# "nothing is wrong". `status` additionally reads the client's machine-readable
-# `crave list --jobID <id> --json` record - status, exit code and timings - and keeps
-# the human tables as its fallback and corroboration, because the tables stopped being
-# drawn for a whole day (job 303483) while the same client kept answering json. See the
-# status block below and docs/M2-CRAVE-BUILD.md for the failure history that forced
-# each of these.
+# `status`, `log`, `watch` and `pull` are all PINNED to a job id ($JOB, else the record
+# `run` wrote to image/out/crave-job.txt) and all EXIT NONZERO when the client cannot
+# answer or answers with an error on its data stream: "I could not look" must never
+# print as "nothing is wrong". `status` and `watch` additionally read the client's
+# machine-readable `crave list --jobID <id> --json` record - status, exit code and
+# timings - and keep the human tables as their fallback and corroboration, because the
+# tables stopped being drawn for a whole day (job 303483) while the same client kept
+# answering json. That matters twice over: `status` could not report the job's real
+# outcome, and `watch`, which DECIDES COMPLETION, could not see the job leave the queue
+# at all. Neither ever resolves the two probes' disagreement in favour of a completion.
+# See the status and watch blocks below and docs/M2-CRAVE-BUILD.md for the failure
+# history that forced each of these.
 #
 # `watch` exists because a free-queue job can sit `queued` for a long time waiting for a
 # build node (observed 2026-09-24 on linux16 - the free queue costs no tokens, it is just
@@ -54,6 +57,12 @@
 #   ATTACH=1             stream the build in the foreground instead of detaching
 #   JOB                  job id to watch (default: read from image/out/crave-job.txt)
 #   WATCH_INTERVAL       seconds between polls in `watch` mode (default 300)
+#   WATCH_MAX_MISSES     polls `watch` tolerates, per give-up condition (default 10):
+#                        nothing answered / the two probes disagree / the client has no
+#                        record of the job at all. None of them may end in a verdict.
+#   WATCH_ONCE=1         run exactly one `watch` poll and exit: 0 while the job is still
+#                        active, 1 when the poll could not name a state. For the offline
+#                        suite, and for a one-off check without a queue behind it.
 #
 # WORKSPACE SCOPING (observed 2026-09-24): the client resolves getlog/pull against the
 # CURRENT DIRECTORY's workspace, and that resolution returned "No running job found on
@@ -126,6 +135,100 @@ active_jobs() {
             print $1 "  " st
           }
         ' ) || true
+}
+
+# ---- the machine-readable job record, shared by `status` and `watch` --------------
+# WHY THIS PROBE EXISTS (observed 2026-10-05, job 303483 - 2h18m, exit 130, and no
+# stdout retained by the platform): the client's human tables stopped being drawn for
+# this account COMPLETELY. `list` answered with "Configured Projects:" /
+# "Configured Platforms:" only, across ~10 calls over hours, while the job had in fact
+# left the queue - so a table parse can only ever report UNKNOWN. The same client
+# answers
+#     crave list --jobID <id> --json
+# with the full record (status, exit code, start/end), which is how that job's real
+# outcome was recovered. Both read-only pollers ask for it: `status` to report, and
+# `watch` to decide COMPLETION - the tables vanishing used to leave it with nothing
+# but the give-up counter.
+#
+# Sets three globals, prints nothing (the caller decides how loudly to report):
+#   JS_RECORD   tab-separated "<section> <status> <exitCode> <start> <end> <duration>
+#               <job_url> <project_name>"; empty unless the job was found
+#   JS_OUTCOME  located | absent | unreadable
+#               (absent = the client answered "no such job in either list", which IS
+#                an answer; unreadable = no usable document came back at all)
+#   JS_NOTE     newline-separated client diagnostics, empty when the answer was clean
+#
+# Judged on TEXT as well as exit status, because this client prints its diagnostics on
+# the data stream and exits 0 - verified 2026-10-05, where the json behind
+# "Error: could not get matching git url ..." was complete and correct. So the record
+# is still parsed and used (it is the most useful thing on screen), and the note is
+# handed back for the caller to fail on: "a diagnostic came attached" is not the same
+# claim as "answered".
+job_state_json() {
+  local want="$1" json_out json_rc=0 line
+  JS_RECORD=""; JS_OUTCOME="unreadable"; JS_NOTE=""
+  if json_out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" list --jobID "$want" --json 2>&1 | tr -d '\r' )"; then
+    :
+  else
+    json_rc=$?
+    JS_NOTE="\`crave list --jobID $want --json\` exited $json_rc"
+  fi
+  if line="$(printf '%s\n' "$json_out" | grep -m1 -E '^(Error|FATAL):')"; then
+    if [ -n "$JS_NOTE" ]; then
+      JS_NOTE="$JS_NOTE
+\`crave list --jobID $want --json\` printed: $line"
+    else
+      JS_NOTE="\`crave list --jobID $want --json\` printed: $line"
+    fi
+  fi
+  command -v python3 >/dev/null 2>&1 || return 0
+  # The client interleaves its error line with the json, so the document is decoded from
+  # the first "{" rather than from offset 0.
+  JS_RECORD="$( printf '%s' "$json_out" | python3 -c '
+import json, sys
+from datetime import datetime
+raw = sys.stdin.read()
+want = sys.argv[1].strip()
+i = raw.find("{")
+if i < 0:
+    sys.exit(0)
+try:
+    data, _ = json.JSONDecoder().raw_decode(raw[i:])
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+def stamp(v):
+    for f in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(str(v), f)
+        except Exception:
+            pass
+    return None
+for section, key in (("active", "jobs_active"), ("history", "jobs_history")):
+    for rec in (data.get(key) or []):
+        if str(rec.get("jobId", "")).strip() != want:
+            continue
+        st = str(rec.get("status", "") or "")
+        ec = "" if rec.get("exitCode") is None else str(rec.get("exitCode"))
+        started = str(rec.get("startTime", "") or "")
+        ended = str(rec.get("endTime", "") or "")
+        dur = ""
+        a, b = stamp(started), stamp(ended)
+        if a and b:
+            secs = int((b - a).total_seconds())
+            if secs >= 0:
+                dur = "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+        print("\t".join([section, st, ec, started, ended, dur,
+                         str(rec.get("job_url", "") or ""),
+                         str(rec.get("project_name", "") or "")]))
+        sys.exit(0)
+print("absent")
+' "$want" 2>/dev/null || true )"
+  case "$JS_RECORD" in
+    active$'\t'*|history$'\t'*) JS_OUTCOME="located" ;;
+    absent) JS_OUTCOME="absent"; JS_RECORD="" ;;
+  esac
 }
 
 repo_url="$(git -C "$REPO_ROOT" remote get-url origin)"
@@ -365,89 +468,24 @@ case "$cmd" in
     row_sec="${row%%$'\t'*}"
     row_txt="${row#*$'\t'}"
     # ---- job state, machine-readable, PINNED to the job (asked of every status) ----
-    # WHY THIS PROBE EXISTS (observed 2026-10-05, job 303483 - 2h18m, exit 130, no
-    # stdout retained by the platform): the client's human tables stopped being drawn
-    # for this account COMPLETELY. `list` answered with "Configured Projects:" /
-    # "Configured Platforms:" only, across ~10 calls over hours, while the job had in
-    # fact left the queue - so the table parse above could only ever report UNKNOWN.
-    # The same client answers
-    #     crave list --jobID <id> --json
-    # with the full record (status, exit code, start/end), which is how the job's real
-    # outcome was recovered. It is therefore parsed here on every status, and the table
-    # verdict above is kept as the fallback and the corroboration - so a client that
-    # cannot answer json still behaves exactly as it did, and a disagreement between
-    # the two is printed instead of silently resolved.
-    json_located=0; json_absent=0; json_sec=""; json_state=""
-    json_rc=0
-    if json_out="$( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" list --jobID "$j" --json 2>&1 | tr -d '\r' )"; then
-      :
-    else
-      json_rc=$?; rc=1
-    fi
-    if [ "$json_rc" -ne 0 ]; then
-      printf '  client error: `crave list --jobID %s --json` exited %s\n' "$j" "$json_rc"
-    fi
-    # Judged on TEXT as well as exit status, because this client prints its
-    # diagnostics on the data stream and exits 0: verified 2026-10-05, where the json
-    # behind "Error: could not get matching git url ..." was complete and correct. So
-    # the state below is still parsed and printed - it is the most useful thing on
-    # screen - but the command exits nonzero, because "answered with a diagnostic
-    # attached" is not the same claim as "answered".
-    if printf '%s\n' "$json_out" | grep -qE '^(Error|FATAL):'; then
-      printf '  client error: `crave list --jobID %s --json` printed: %s\n' \
-             "$j" "$(printf '%s\n' "$json_out" | grep -m1 -E '^(Error|FATAL):')"
+    # The probe itself lives in job_state_json() at the top of this file, because
+    # `watch` needs the same answer: it decides completion, so a client that stopped
+    # drawing its tables used to leave it with nothing but the give-up counter (see the
+    # watch block). The table verdict above is kept as the fallback and the
+    # corroboration - a client that cannot answer json still behaves exactly as it did,
+    # and a disagreement between the two is printed instead of silently resolved.
+    job_state_json "$j"
+    json_state="$JS_RECORD"
+    if [ -n "$JS_NOTE" ]; then
+      printf '%s\n' "$JS_NOTE" | sed 's|^|  client error: |'
       rc=1
     fi
-    if command -v python3 >/dev/null 2>&1; then
-      # The client interleaves its error line with the json, so the document is decoded
-      # from the first "{" rather than from offset 0. Fields come back tab separated:
-      # <section> <status> <exitCode> <start> <end> <duration> <job_url> <project_name>
-      json_state="$( printf '%s' "$json_out" | python3 -c '
-import json, sys
-from datetime import datetime
-raw = sys.stdin.read()
-want = sys.argv[1].strip()
-i = raw.find("{")
-if i < 0:
-    sys.exit(0)
-try:
-    data, _ = json.JSONDecoder().raw_decode(raw[i:])
-except Exception:
-    sys.exit(0)
-if not isinstance(data, dict):
-    sys.exit(0)
-def stamp(v):
-    for f in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            return datetime.strptime(str(v), f)
-        except Exception:
-            pass
-    return None
-for section, key in (("active", "jobs_active"), ("history", "jobs_history")):
-    for rec in (data.get(key) or []):
-        if str(rec.get("jobId", "")).strip() != want:
-            continue
-        st = str(rec.get("status", "") or "")
-        ec = "" if rec.get("exitCode") is None else str(rec.get("exitCode"))
-        started = str(rec.get("startTime", "") or "")
-        ended = str(rec.get("endTime", "") or "")
-        dur = ""
-        a, b = stamp(started), stamp(ended)
-        if a and b:
-            secs = int((b - a).total_seconds())
-            if secs >= 0:
-                dur = "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
-        print("\t".join([section, st, ec, started, ended, dur,
-                         str(rec.get("job_url", "") or ""),
-                         str(rec.get("project_name", "") or "")]))
-        sys.exit(0)
-print("absent")
-' "$j" 2>/dev/null || true )"
-    fi
-    case "$json_state" in
-      active$'\t'*)  json_located=1; json_sec=active ;;
-      history$'\t'*) json_located=1; json_sec=history ;;
-      absent)        json_absent=1 ;;
+    # The section (active|history) is the record's own first field; `absent` is not a
+    # record at all, so it cannot be a section - it is carried by JS_OUTCOME.
+    json_located=0; json_absent=0; json_sec=""
+    case "$JS_OUTCOME" in
+      located) json_located=1; json_sec="${json_state%%$'\t'*}" ;;
+      absent)  json_absent=1 ;;
     esac
 
     if [ "$json_located" = 1 ]; then
@@ -616,58 +654,185 @@ print("absent")
     # Crave reports the outcome only in the job log, so completion is "the job is no
     # longer queued or running": then the log decides between success and failure, and a
     # success is followed straight through to the pull.
+    #
+    # "No longer queued or running" used to be read out of the HUMAN TABLE alone, which
+    # made the 2026-10-05 blind spot fatal here: the tables stopped being drawn entirely
+    # (job 303483), so the loop could never see the job leave the queue and would sit on
+    # it until the "10 empty polls" guard gave up - having learned nothing, while the
+    # real outcome was one query away. So `watch` asks the same machine-readable probe
+    # `status` does (job_state_json at the top of this file) on EVERY poll, keeps the
+    # table as its fallback and its corroboration, and never resolves a disagreement
+    # between the two into a completion. The failure mode this block must not have is
+    # "watch declared the build over while it was still running".
     ensure_ticket >/dev/null
     JOB="$(job_record)"
     [ -n "$JOB" ] || die "no job id: set JOB=<id>, or run 'run' first so image/out/crave-job.txt exists"
     interval="${WATCH_INTERVAL:-300}"
+    # Bound on each of the three give-up counters below (was a flat 10). Every one of
+    # them is a way of NOT concluding anything - none of them may end in a verdict.
+    max_misses="${WATCH_MAX_MISSES:-10}"
     # A long wait must not be ended by one flaky poll: under `set -e` a non-zero result
-    # from either probe would abort the whole watch silently, which is exactly how an
-    # artifact gets missed. Both readers are therefore total - they swallow failure and
-    # report "unknown" instead, and the loop keeps its own count of consecutive failures.
-    # The active-jobs table is "Id  Workspace  Commands...  Status". The Commands
-    # column holds the multi-line `bash -lc '...'` payload, so a fixed column index
-    # reads the command text (observed: state="-lc") and never the status - the job
-    # then looks permanently in-flight and completion is missed. Take the last field,
-    # and accept it only if it is a known status word.
+    # from any probe would abort the whole watch silently, which is exactly how an
+    # artifact gets missed. Every reader here is therefore total - they swallow failure
+    # and report nothing instead, and the loop keeps its own counts.
+    # WATCH_ONCE=1 runs exactly one poll and exits: 0 while the job is still active, 1
+    # when the poll could not name a state (a silent client, or two probes that
+    # disagree) - the same fail-closed exit `status` gives. It exists so the offline
+    # suite can drive `watch` with no queue behind it.
+    #
+    # The table is "Id  Workspace  Commands...  Status". The Commands column holds the
+    # multi-line `bash -lc '...'` payload, so a fixed column index reads the command text
+    # (observed: state="-lc") and never the status - the job then looks permanently
+    # in-flight and completion is missed. Take the last field, and accept it only if it
+    # is a known status word.
     read_state() {
       ( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" list 2>/dev/null | tr -d '\r' | awk -v j="$JOB" '
           $1==j {
             for (i=NF; i>=1; i--)
-              if ($i ~ /^(queued|pending|starting|running|failed|success|succeeded|successful|complete|completed|cancelled|canceled|stopped|error|timeout|timedout)$/) { print $i; exit }
+              if ($i ~ /^(queued|pending|starting|running|failed|success|succeeded|successful|complete|completed|cancelled|canceled|stopped|error|timeout|timedout|done)$/) { print $i; exit }
             print "unknown"; exit
           }' ) || true
     }
     read_last() {
       ( cd "$TICKET_DIR" && timeout 90 bash "$CRAVE_SHIM" getlog --projectID "$CRAVE_PROJECT_ID" --jobID "$JOB" 2>/dev/null | tr -d '\r' | tail -1 ) || true
     }
-    misses=0
+    # The state words that mean "still in the queue", in ONE place: the json record and
+    # the table row are compared against the same list, or a mere naming difference
+    # (json "building" vs table "running") would be reported as a dispute. Note the
+    # old loop knew only queued|pending|starting|running, so a "building" or "syncing"
+    # job read as TERMINAL and the log was captured mid-build.
+    still_active() {
+      case "$1" in
+        queued|pending|starting|running|building|syncing) return 0 ;;
+      esac
+      return 1
+    }
+    misses=0; disputes=0; unseen=0
     log "watching job $JOB every ${interval}s"
     while :; do
-      state="$(read_state)"
+      job_state_json "$JOB"
+      j_note="$JS_NOTE"; j_outcome="$JS_OUTCOME"; j_rec="$JS_RECORD"
+      # The table is still asked every poll: it is the fallback when the json cannot be
+      # read, and the corroboration when it can. Cheaper than it looks - both are local
+      # client calls against the API we would have to poll anyway.
+      table_state="$(read_state)"
       last="$(read_last)"
-      if [ -z "$state" ] && [ -z "$last" ]; then
-        misses=$(( misses + 1 ))
-        printf '%s  job=%s  state=unknown  (no answer from the client; miss %s)\n' \
-          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$JOB" "$misses"
-        [ "$misses" -lt 10 ] || die "the client answered nothing 10 times in a row - giving up rather than reporting a false completion"
+      stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      if [ -n "$j_note" ]; then
+        printf '%s\n' "$j_note" | sed 's|^|  client error: |'
+      fi
+
+      # ---- what the json says, out of the record's own fields ----
+      state=""; facts=""
+      if [ "$j_outcome" = located ]; then
+        rest="${j_rec#*$'\t'}"
+        state="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+        j_exit="${rest%%$'\t'*}";  rest="${rest#*$'\t'}"
+        # The record's start/end window is `status`'s to print; what `watch` needs to
+        # say at the end of a build is the verdict (exit code) and how long it took.
+        rest="${rest#*$'\t'}"   # past startTime
+        rest="${rest#*$'\t'}"   # past endTime
+        j_dur="${rest%%$'\t'*}"
+        if [ -n "$j_exit" ] || [ -n "$j_dur" ]; then
+          facts="${j_exit:+exit code $j_exit}${j_dur:+ ($j_dur)}, from \`crave list --jobID $JOB --json\`"
+        fi
+      fi
+      # ---- did anything answer at all? ----
+      # An "absent" record counts: the client saying "no such job" IS an answer, and
+      # calling that silence is how a poll loop talks itself into the wrong conclusion.
+      answer=no
+      if [ "$j_outcome" != unreadable ]; then answer=yes; fi
+      if [ -n "$table_state" ]; then answer=yes; fi
+      if [ -n "$last" ]; then answer=yes; fi
+
+      # ---- do the two probes agree? ----
+      # Only ever a dispute when BOTH named the job and meant opposite things. "json
+      # found it, the table drew nothing" is not a disagreement - that is precisely what
+      # the client did for hours on 2026-10-05, and the json is the more specific
+      # answer of the two. A dispute is reported and the loop keeps waiting; it is NEVER
+      # resolved into a completion, in either direction.
+      disputed=""
+      if [ "$j_outcome" = located ] && [ -n "$table_state" ] && [ "$table_state" != unknown ]; then
+        if still_active "$state"; then
+          if ! still_active "$table_state"; then
+            disputed="the json record says '$state' but the table row says '$table_state'"
+          fi
+        elif still_active "$table_state"; then
+          disputed="the json record says '$state' but the table row says '$table_state'"
+        fi
+      elif [ "$j_outcome" = absent ] && [ -n "$table_state" ]; then
+        disputed="the json record has no such job but the table still lists it as '$table_state'"
+      fi
+      if [ -n "$disputed" ]; then
+        disputes=$(( disputes + 1 ))
+        printf '%s  job=%s  state=DISPUTED  %s (dispute %s of %s)\n' \
+          "$stamp" "$JOB" "$disputed" "$disputes" "$max_misses"
+        printf '  (not treating this as a completion - the job may still be running)\n'
+        [ "$disputes" -lt "$max_misses" ] || die "the two probes have disagreed $disputes times in a row - giving up rather than reporting a completion neither of them claims"
+        if [ -n "${WATCH_ONCE:-}" ]; then exit 1; fi
         sleep "$interval"
         continue
       fi
-      misses=0
-      printf '%s  job=%s  state=%s  | %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$JOB" "${state:-<left queue>}" "$last"
+
+      # ---- the client has no record of this job anywhere ----
+      # Distinct from silence and from a completion: the machine-readable record says
+      # the job is in neither list, so its id may be wrong or the client may have lost
+      # it. Waiting is the only safe answer - calling that a finished build is exactly
+      # the false completion this block exists to prevent - but not waiting forever is
+      # also the point of the counter.
+      if [ "$j_outcome" = absent ] && [ -z "$table_state" ] && [ -z "$last" ]; then
+        unseen=$(( unseen + 1 ))
+        # No `| <log tail>` here by construction: this branch requires an empty one.
+        printf '%s  job=%s  state=unseen  (the client has no record of job %s in either job list; not a completion; unseen %s of %s)\n' \
+          "$stamp" "$JOB" "$JOB" "$unseen" "$max_misses"
+        [ "$unseen" -lt "$max_misses" ] || die "the client has reported no job $JOB at all $unseen times in a row - check the job id (JOB=<id>) and that the job was really launched"
+        if [ -n "${WATCH_ONCE:-}" ]; then exit 1; fi
+        sleep "$interval"
+        continue
+      fi
+
+      # ---- nothing answered ----
+      if [ "$answer" = no ]; then
+        misses=$(( misses + 1 ))
+        printf '%s  job=%s  state=unknown  (no answer from the client; miss %s of %s)\n' \
+          "$stamp" "$JOB" "$misses" "$max_misses"
+        [ "$misses" -lt "$max_misses" ] || die "the client answered nothing $misses times in a row - giving up rather than reporting a false completion"
+        if [ -n "${WATCH_ONCE:-}" ]; then exit 1; fi
+        sleep "$interval"
+        continue
+      fi
+      misses=0; disputes=0; unseen=0
+
+      # json first, table as the fallback. Its word is the one shown and the one the
+      # completion decision is made on - except when the json could not be read at all,
+      # where the table's word (or its absence) stands exactly as it did before.
+      source="json"
+      if [ "$j_outcome" != located ]; then
+        state="$table_state"
+        source="table"
+      elif [ -n "$table_state" ] && [ "$table_state" != unknown ] && [ "$table_state" != "$state" ]; then
+        # Both named it and mean the same thing by different words (json "syncing" vs
+        # table "running"): worth showing, not worth calling a dispute.
+        source="json+table"
+      fi
+      printf '%s  job=%s  state=%s [%s]  | %s\n' \
+        "$stamp" "$JOB" "${state:-<left queue>}" "$source" "$last"
+
       # Still active -> keep polling. Anything else is terminal: a named end state, or
-      # the job having left the active-jobs table entirely (state empty while the
-      # client DID answer, so this is not the "no answer" case handled above).
-      case "$state" in
-        queued|pending|starting|running) sleep "$interval"; continue ;;
-      esac
-      log "job $JOB is no longer active (state=${state:-<left queue>}) - capturing the remote log"
+      # the job having left the queue while the client DID answer (so this is not the
+      # "no answer" case above).
+      if still_active "${state:-}"; then
+        if [ -n "${WATCH_ONCE:-}" ]; then exit 0; fi
+        sleep "$interval"
+        continue
+      fi
+      log "job $JOB is no longer active (state=${state:-<left queue>}${facts:+ - $facts}) - capturing the remote log"
       ( cd "$TICKET_DIR" && bash "$CRAVE_SHIM" getlog --projectID "$CRAVE_PROJECT_ID" --jobID "$JOB" ) > "$REPO_ROOT/image/out/crave-remote-log.txt" 2>&1 || true
       if grep -qi 'build successful' "$REPO_ROOT/image/out/crave-remote-log.txt"; then
         log "remote build reported success - pulling the artifact and the X2 record"
         bash "$REPO_ROOT/tools/crave/run-remote-build.sh" pull
       else
-        die "job $JOB ended in state '${state:-unknown}' without 'Build Successful'; see image/out/crave-remote-log.txt"
+        die "job $JOB ended in state '${state:-<left queue>}'${facts:+ - $facts} without 'Build Successful'; see image/out/crave-remote-log.txt"
       fi
       break
     done
